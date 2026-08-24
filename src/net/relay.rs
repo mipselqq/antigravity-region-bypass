@@ -10,6 +10,9 @@ use crate::net::resolvers;
 
 pub const LISTEN_IP: &str = "127.0.0.53";
 pub const LISTEN_PORT: u16 = 53;
+#[cfg(target_os = "macos")]
+const WORKER_THREADS: usize = 1;
+#[cfg(not(target_os = "macos"))]
 const WORKER_THREADS: usize = 4;
 
 static UPSTREAM_CACHE: std::sync::RwLock<Option<Vec<Ipv4Addr>>> = std::sync::RwLock::new(None);
@@ -152,6 +155,7 @@ pub fn run() -> Result<(), String> {
     let _ = crate::net::socket::set_socket_buffers(&socket, 512 * 1024);
     log_line(&format!("start {}", addr));
     resolvers::warmup(load_if_index());
+    #[cfg(not(target_os = "macos"))]
     crate::net::rank::spawn_background();
     let sock_arc = Arc::new(socket);
 

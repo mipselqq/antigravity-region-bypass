@@ -275,8 +275,14 @@ pub fn enable() -> Result<(), String> {
         <key>Crashed</key>
         <true/>
     </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
     <key>ThrottleInterval</key>
-    <integer>5</integer>
+    <integer>30</integer>
     <key>StandardErrorPath</key>
     <string>{}</string>
     <key>StandardOutPath</key>

@@ -110,23 +110,33 @@ pub fn apply_dns_rules() -> Result<String, String> {
 
     let mut relay_ok = false;
     let mut relay_note = String::new();
-    step("запуск локального релея 127.0.0.53:53");
-    match crate::system::service::enable() {
-        Ok(()) => {
-            for _ in 0..40 {
-                if crate::system::service::is_running() {
-                    relay_ok = true;
-                    break;
+    #[cfg(target_os = "windows")]
+    {
+        step("запуск локального релея 127.0.0.53:53");
+        match crate::system::service::enable() {
+            Ok(()) => {
+                for _ in 0..40 {
+                    if crate::system::service::is_running() {
+                        relay_ok = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
                 }
-                thread::sleep(Duration::from_millis(100));
+                if !relay_ok {
+                    relay_note = "релей не поднялся за 4с, NRPT напрямую на SmartDNS".into();
+                }
             }
-            if !relay_ok {
-                relay_note = "релей не поднялся за 4с, NRPT напрямую на SmartDNS".into();
+            Err(e) => {
+                relay_note = format!("релей не установлен ({e}), NRPT напрямую на SmartDNS");
             }
         }
-        Err(e) => {
-            relay_note = format!("релей не установлен ({e}), NRPT напрямую на SmartDNS");
-        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // No resident daemon: /etc/resolver talks to SmartDNS directly.
+        // Lid close / sleep then costs nothing (no wake, no polling).
+        step("DNS через /etc/resolver (без фонового процесса)");
+        let _ = crate::system::service::disable();
     }
 
     let mut rules: Vec<(String, String)> = Vec::new();
@@ -161,13 +171,18 @@ pub fn apply_dns_rules() -> Result<String, String> {
     }
 
     step("ранжирование прокси Cloud Code (быстрый первый, остальные запас)");
-    let ranked = crate::net::rank::rescan_agent(if_index);
-    for note in crate::net::rank::format_notes(&ranked) {
-        sub_notes.push(note);
+    #[cfg(target_os = "windows")]
+    {
+        let ranked = crate::net::rank::rescan_agent(if_index);
+        for note in crate::net::rank::format_notes(&ranked) {
+            sub_notes.push(note);
+        }
     }
 
     let mut msg = if relay_ok {
         format!("Сеть настроена (релей {}:{})", LISTEN_IP, LISTEN_PORT)
+    } else if cfg!(target_os = "macos") {
+        "Сеть настроена (/etc/resolver, без фона)".to_string()
     } else if relay_note.is_empty() {
         "Сеть настроена".to_string()
     } else {

@@ -452,8 +452,17 @@ apply_dns_resolvers() {
     shift
     local servers=("$@")
 
-    echo -e "${YELLOW}Применение селективной DNS-маршрутизации через ${label}...${NC}"
+    echo -e "${YELLOW}Применение селективной DNS-маршрутизации...${NC}"
     mkdir -p "$RESOLVER_DIR"
+
+    # If an older build left a LaunchDaemon, stop it: Mac should not keep
+    # a process running while the lid is closed.
+    if [[ -f "$LAUNCHD_PLIST" ]]; then
+        launchctl bootout system/com.antigravity.bypass.russia 2>/dev/null || \
+        launchctl unload -w "$LAUNCHD_PLIST" 2>/dev/null || true
+        rm -f "$LAUNCHD_PLIST"
+    fi
+    pkill -f "ag_dns --dns-forwarder" 2>/dev/null || true
 
     local old_umask
     old_umask=$(umask)
@@ -477,7 +486,7 @@ apply_dns_resolvers() {
     # Flush macOS DNS cache
     dscacheutil -flushcache
     killall -HUP mDNSResponder 2>/dev/null || true
-    echo -e "${GREEN}  [✓] Создано ${#DOMAINS[@]} правил в /etc/resolver/ (${label})${NC}"
+    echo -e "${GREEN}  [✓] Создано ${#DOMAINS[@]} правил в /etc/resolver/${NC}"
 }
 
 remove_dns_resolvers() {
@@ -531,9 +540,9 @@ show_dashboard() {
     echo -e "${GRAY}  • Права процесса:       ${GREEN}[✓] Администратор${NC}"
     
     if [[ "$rule_count" -gt 0 ]]; then
-        echo -e "${GRAY}  • Сеть и DNS (NRPT):    ${GREEN}[✓] (Xbox-DNS.ru)${NC}"
+        echo -e "${GRAY}  • Сеть и DNS:           ${GREEN}[✓] Настроено${NC}"
     else
-        echo -e "${GRAY}  • Сеть и DNS (NRPT):    ${GRAY}[Не настроено]${NC}"
+        echo -e "${GRAY}  • Сеть и DNS:           ${GRAY}[Не настроено]${NC}"
     fi
 
     local arch
@@ -554,34 +563,12 @@ show_dashboard() {
     echo -e "${GRAY}  └────────────────────────────────────────────────────────┘\n${NC}"
 }
 
-select_dns() {
-    echo -e "\n${CYAN}Выберите DNS-провайдер для маршрутизации:${NC}"
-    echo -e "  ${YELLOW}1. Xbox-DNS.ru (111.88.96.50, 111.88.96.51)${NC}"
-    echo -e "  ${GREEN}2. Ввести свой DNS / IP адрес личного VPS${NC}"
-    read -rp "Ваш выбор [1-2] (Enter - Xbox-DNS): " dns_choice
-
-    case "$dns_choice" in
-        2)
-            read -rp "Введите IP адрес(а) DNS через запятую или пробел: " custom_ip
-            if [[ -z "$custom_ip" ]]; then
-                DNS_LABEL="Xbox-DNS.ru"
-                DNS_SERVERS=("${XBOX_SERVERS[@]}")
-            else
-                DNS_LABEL="Пользовательский DNS"
-                custom_ip="${custom_ip//,/ }"
-                read -r -a DNS_SERVERS <<< "$custom_ip"
-            fi
-            ;;
-        *) DNS_LABEL="Xbox-DNS.ru"; DNS_SERVERS=("${XBOX_SERVERS[@]}") ;;
-    esac
-}
-
 # --- Main Menu Loop ---
 main_menu() {
     while true; do
         safe_clear
         echo -e "${CYAN}=====================================================${NC}"
-        echo -e "${CYAN}    ANTIGRAVITY-BYPASS-RUSSIA (v1.0.1) FOR macOS     ${NC}"
+        echo -e "${CYAN}          ANTIGRAVITY-BYPASS-RUSSIA (v1.1.0)         ${NC}"
         echo -e "${CYAN}=====================================================${NC}"
         echo -e "Утилита обхода региональных ограничений и чистый откат\n"
 
@@ -599,7 +586,8 @@ main_menu() {
 
         case "$action" in
             1)
-                select_dns
+                DNS_LABEL="SmartDNS"
+                DNS_SERVERS=("${XBOX_SERVERS[@]}")
                 kill_antigravity_processes
                 while IFS= read -r inst; do
                     [[ -z "$inst" ]] && continue
@@ -663,7 +651,8 @@ main_menu() {
                 read -rp "Нажмите Enter для продолжения..."
                 ;;
             3)
-                select_dns
+                DNS_LABEL="SmartDNS"
+                DNS_SERVERS=("${XBOX_SERVERS[@]}")
                 apply_dns_resolvers "$DNS_LABEL" "${DNS_SERVERS[@]}"
                 read -rp "Нажмите Enter для продолжения..."
                 ;;
