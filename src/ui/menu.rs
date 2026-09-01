@@ -147,16 +147,30 @@ pub fn handle_rollback() {
     crate::core::endpoint::remove_all();
     println!("  \x1b[92m[✓]\x1b[0m jetski.cloudCodeUrl / CLOUD_CODE_URL сняты");
 
-    println!("\n\x1b[93mУдаление сетевых правил и служб:\x1b[0m");
+    println!("\n\x1b[93mУдаление сетевых правил, сертификатов и служб:\x1b[0m");
     remove_dns_rules();
     println!("  \x1b[92m[✓]\x1b[0m Служба DNS-релея остановлена и удалена");
     println!("  \x1b[92m[✓]\x1b[0m Правила NRPT и статические маршруты очищены");
     println!("  \x1b[92m[✓]\x1b[0m Системный кэш DNS сброшен");
 
+    crate::system::privilege::clean_legacy_certificates();
+    println!("  \x1b[92m[✓]\x1b[0m Старые сертификаты CA очищены");
+
+    let _ = crate::net::provider::save_custom_upstream(None);
+
     #[cfg(target_os = "windows")]
     {
-        delete_user_env_vars(&["GEMINI_API_BASE_URL", "GOOGLE_GEMINI_ENDPOINT", "CLOUD_CODE_URL"]);
-        println!("  \x1b[92m[✓]\x1b[0m Переменные окружения сброшены");
+        delete_user_env_vars(&[
+            "GEMINI_API_BASE_URL",
+            "GOOGLE_GEMINI_ENDPOINT",
+            "CLOUD_CODE_URL",
+            "NODE_EXTRA_CA_CERTS",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "ALL_PROXY",
+        ]);
+        println!("  \x1b[92m[✓]\x1b[0m Переменные окружения и прокси сброшены");
     }
 
     println!("\n\x1b[92m=====================================================\x1b[0m");
@@ -331,6 +345,30 @@ pub fn handle_diagnostics() {
         }
     }
 
+    println!("\n\x1b[96m--- Статистика прокси и сокетов (Telemetry) ---\x1b[0m");
+    let sessions = crate::net::proxy::get_recent_sessions();
+    if sessions.is_empty() {
+        println!("  \x1b[90m[-- сессий через локальный прокси пока не зафиксировано --]\x1b[0m");
+    } else {
+        println!("  {:<28} {:<18} {:<8} {:<10} {:<10} {}", "Целевой хост", "Маршрут", "Пинг", "Tx (KB)", "Rx (KB)", "Статус");
+        for s in sessions.iter().rev().take(8) {
+            let status_colored = match s.status.as_str() {
+                "OK" => "\x1b[92mOK\x1b[0m",
+                "Timeout" => "\x1b[91mTimeout (10m)\x1b[0m",
+                _ => "\x1b[93mClosed\x1b[0m",
+            };
+            println!(
+                "  {:<28} {:<18} {:<8} {:<10.1} {:<10.1} {}",
+                if s.target.len() > 27 { &s.target[..27] } else { &s.target },
+                if s.upstream.len() > 17 { &s.upstream[..17] } else { &s.upstream },
+                format!("{}мс", s.duration_ms),
+                s.tx_bytes as f64 / 1024.0,
+                s.rx_bytes as f64 / 1024.0,
+                status_colored
+            );
+        }
+    }
+
     println!("\n\x1b[92m[✓] Диагностика системы завершена.\x1b[0m");
     pause();
 }
@@ -340,27 +378,77 @@ pub fn handle_proxy_menu() {
     banner();
     println!("\x1b[96m=== ЛОКАЛЬНЫЙ HTTP / SOCKS5 ПРОКСИ И PAC ГЕНЕРАТОР ===\x1b[0m\n");
 
-    let http_port = crate::net::proxy::DEFAULT_HTTP_PROXY_PORT;
-    let socks5_port = crate::net::proxy::DEFAULT_SOCKS5_PROXY_PORT;
-
-    match crate::net::proxy::start_proxy_servers(http_port, socks5_port) {
-        Ok(()) => {
-            println!("\x1b[92m[✓] Локальные прокси-серверы успешно запущены:\x1b[0m");
-            println!("  • HTTP CONNECT прокси:  \x1b[96mhttp://127.0.0.1:{}\x1b[0m", http_port);
-            println!("  • SOCKS5 прокси:        \x1b[96msocks5://127.0.0.1:{}\x1b[0m", socks5_port);
-            println!("  • Dynamic PAC URL:      \x1b[93mhttp://127.0.0.1:{}/proxy.pac\x1b[0m\n", http_port);
-
-            println!("\x1b[90mСелективная маршрутизация активна: Google AI домены направляются через зарубежный SNI-релей, остальные напрямую.\x1b[0m\n");
-            println!("Как использовать в Antigravity IDE / VS Code / Терминале:");
-            println!("  \x1b[33msetx HTTP_PROXY \"http://127.0.0.1:{}\"\x1b[0m", http_port);
-            println!("  \x1b[33msetx HTTPS_PROXY \"http://127.0.0.1:{}\"\x1b[0m", http_port);
-            println!("  \x1b[33msetx ALL_PROXY \"socks5://127.0.0.1:{}\"\x1b[0m\n", socks5_port);
-        }
-        Err(e) => {
-            println!("\x1b[93m[i] {}\x1b[0m", e);
-        }
+    let custom = crate::net::provider::load_custom_upstream();
+    if let Some(c) = &custom {
+        println!("  Текущий внешний Upstream: \x1b[92m{}:{}\x1b[0m (Авторизация: {})\n", c.host, c.port, if c.auth_header.is_some() { "Да" } else { "Нет" });
+    } else {
+        println!("  Текущий внешний Upstream: \x1b[90m[Встроенные скоростные SNI-релеи]\x1b[0m\n");
     }
-    pause();
+
+    println!("1. \x1b[92mЗапустить локальные прокси\x1b[0m (HTTP: 8989, SOCKS5: 10808)");
+    println!("2. \x1b[93mНастроить свой внешний Upstream прокси\x1b[0m (VPS: http://user:pass@host:port)");
+    println!("3. \x1b[91mСбросить внешний Upstream\x1b[0m (вернуться к встроенным релеям)");
+    println!("4. \x1b[96mПосмотреть журнал сессий прокси\x1b[0m");
+    println!("0. Назад в главное меню\n");
+
+    let choice = prompt("Выберите действие [0-4]: ");
+    match choice.as_str() {
+        "1" => {
+            let http_port = crate::net::proxy::DEFAULT_HTTP_PROXY_PORT;
+            let socks5_port = crate::net::proxy::DEFAULT_SOCKS5_PROXY_PORT;
+
+            match crate::net::proxy::start_proxy_servers(http_port, socks5_port) {
+                Ok(()) => {
+                    println!("\n\x1b[92m[✓] Локальные прокси-серверы успешно запущены:\x1b[0m");
+                    println!("  • HTTP CONNECT прокси:  \x1b[96mhttp://127.0.0.1:{}\x1b[0m", http_port);
+                    println!("  • SOCKS5 прокси:        \x1b[96msocks5://127.0.0.1:{}\x1b[0m", socks5_port);
+                    println!("  • Dynamic PAC URL:      \x1b[93mhttp://127.0.0.1:{}/proxy.pac\x1b[0m\n", http_port);
+
+                    println!("\x1b[90mСелективная маршрутизация активна: 10-минутный Thinking Shield и 150s Keep-Alive включены.\x1b[0m\n");
+                    println!("Как использовать в Antigravity IDE / VS Code / Терминале:");
+                    println!("  \x1b[33msetx HTTP_PROXY \"http://127.0.0.1:{}\"\x1b[0m", http_port);
+                    println!("  \x1b[33msetx HTTPS_PROXY \"http://127.0.0.1:{}\"\x1b[0m", http_port);
+                    println!("  \x1b[33msetx ALL_PROXY \"socks5://127.0.0.1:{}\"\x1b[0m\n", socks5_port);
+                }
+                Err(e) => {
+                    println!("\x1b[93m[i] {}\x1b[0m", e);
+                }
+            }
+            pause();
+        }
+        "2" => {
+            println!("\nВведите адрес вашего зарубежного HTTP/SOCKS5 прокси.");
+            println!("Примеры:  http://45.155.204.190:8080");
+            println!("          http://user:password@my-vps.com:3128");
+            let url = prompt("Upstream URL: ");
+            if !url.trim().is_empty() {
+                if let Err(e) = crate::net::provider::save_custom_upstream(Some(&url)) {
+                    println!("\x1b[31m[✗] Ошибка сохранения: {}\x1b[0m", e);
+                } else {
+                    println!("\x1b[92m[✓] Внешний Upstream прокси успешно сохранен.\x1b[0m");
+                }
+            }
+            pause();
+        }
+        "3" => {
+            let _ = crate::net::provider::save_custom_upstream(None);
+            println!("\n\x1b[92m[✓] Пользовательский Upstream сброшен. Используются встроенные релеи.\x1b[0m");
+            pause();
+        }
+        "4" => {
+            println!("\n\x1b[96m--- Последние сессии через прокси ---\x1b[0m");
+            let sessions = crate::net::proxy::get_recent_sessions();
+            if sessions.is_empty() {
+                println!("  \x1b[90m[-- Нет активных записей --]\x1b[0m");
+            } else {
+                for s in sessions.iter().rev() {
+                    println!("  [{}] {} ➔ {} ({}мс) tx: {}B, rx: {}B [{}]", s.timestamp_epoch, s.target, s.upstream, s.duration_ms, s.tx_bytes, s.rx_bytes, s.status);
+                }
+            }
+            pause();
+        }
+        _ => {}
+    }
 }
 
 pub fn handle_watcher_menu() {
