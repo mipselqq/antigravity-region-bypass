@@ -129,11 +129,15 @@ pub fn handle_rollback() {
             print_patch_result(t, restore_target(t));
         }
 
-        let app_dir = inst.join("resources").join("app");
-        let app_asar = inst.join("resources").join("app.asar");
-        if app_dir.exists() && app_asar.exists() {
-            let _ = std::fs::remove_dir_all(&app_dir);
-            println!("  \x1b[92m[✓]\x1b[0m resources/app удален (возврат к оригинальному app.asar)");
+        let app_dirs = [
+            inst.join("resources").join("app"),
+            inst.join("Contents").join("Resources").join("app"),
+        ];
+        for app_dir in app_dirs {
+            if app_dir.exists() {
+                let _ = std::fs::remove_dir_all(&app_dir);
+                println!("  \x1b[92m[✓]\x1b[0m {} удален (возврат к оригинальному app.asar)", mask_path(&app_dir));
+            }
         }
     }
 

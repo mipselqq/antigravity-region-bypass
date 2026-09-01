@@ -50,12 +50,12 @@ pub const NRPT_STUDIO: &[&str] = &[
     ".s-aiplatform.googleapis.com",
 ];
 
-/// Agent Cloud Code hosts. Each gets its own NRPT nameserver list —
-/// only providers that actually substitute *this* name. xbox-dns is
-/// fine for Studio and poison for daily-cloudcode-pa.
+/// Agent Cloud Code & Gemini API hosts. Each gets its own NRPT nameserver list —
+/// only providers that actually substitute *this* name, with fallback to ranked SNI proxies.
 pub const NRPT_AGENT: &[&str] = &[
     "daily-cloudcode-pa.googleapis.com",
     "cloudcode-pa.googleapis.com",
+    "generativelanguage.googleapis.com",
 ];
 
 /// Geohide HTTP/SNI frontends. Used when VPN makes SmartDNS skip substitution:

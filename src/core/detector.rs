@@ -116,8 +116,13 @@ pub fn find_installations() -> Vec<PathBuf> {
         let candidates = [
             "/Applications/Antigravity.app",
             "/Applications/Antigravity IDE.app",
+            "/Applications/Google Antigravity.app",
             "~/Applications/Antigravity.app",
             "~/Applications/Antigravity IDE.app",
+            "~/Applications/Google Antigravity.app",
+            "~/Library/Application Support/Antigravity",
+            "~/Library/Application Support/Antigravity IDE",
+            "~/Library/Application Support/Google Antigravity",
             "/opt/homebrew/Caskroom/antigravity",
             "/opt/homebrew/Caskroom/antigravity-ide",
             "/opt/homebrew/bin",
@@ -161,12 +166,20 @@ pub fn find_installations() -> Vec<PathBuf> {
         let candidates = [
             "/opt/antigravity",
             "/opt/Antigravity",
+            "/opt/antigravity-ide",
+            "/opt/Antigravity IDE",
+            "/usr/lib/antigravity",
+            "/usr/lib/antigravity-ide",
             "/usr/share/antigravity",
+            "/usr/share/antigravity-ide",
             "~/.local/share/antigravity",
+            "~/.local/share/antigravity-ide",
+            "~/.config/Antigravity",
+            "~/.config/Antigravity IDE",
         ];
         for c in candidates {
             let p = expand_env_vars(c);
-            if p.exists() && p.is_dir() && !installs.contains(&p) {
+            if p.exists() && !installs.contains(&p) {
                 installs.push(p);
             }
         }
@@ -204,7 +217,9 @@ pub fn find_targets_in_path(root: &Path) -> Vec<FoundTarget> {
 
     if root.is_file() {
         let name = root.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let kind = if name.ends_with(".js") {
+        let kind = if name.ends_with(".asar") {
+            TargetKind::IdeAsar
+        } else if name.ends_with(".js") {
             TargetKind::IdeMainJs
         } else if name.contains("agy") {
             TargetKind::AgyCli
@@ -225,6 +240,9 @@ pub fn find_targets_in_path(root: &Path) -> Vec<FoundTarget> {
         "language_server.exe",
         "language_server_darwin_arm64",
         "language_server_darwin_x64",
+        "language_server_linux_x64",
+        "language_server_linux_arm64",
+        "language_server_linux_amd64",
         "language_server",
         "agy.exe",
         "agy",
@@ -239,12 +257,14 @@ pub fn find_targets_in_path(root: &Path) -> Vec<FoundTarget> {
         PathBuf::from("resources").join("app").join("bin"),
         PathBuf::from("resources").join("app").join("extensions").join("antigravity").join("bin"),
         PathBuf::from("resources").join("app.asar.unpacked").join("bin"),
+        PathBuf::from("resources").join("app.asar.unpacked").join("extensions").join("antigravity").join("bin"),
         PathBuf::from("Contents").join("Resources"),
         PathBuf::from("Contents").join("Resources").join("bin"),
         PathBuf::from("Contents").join("Resources").join("app"),
         PathBuf::from("Contents").join("Resources").join("app").join("bin"),
         PathBuf::from("Contents").join("Resources").join("app").join("extensions").join("antigravity").join("bin"),
         PathBuf::from("Contents").join("Resources").join("app.asar.unpacked").join("bin"),
+        PathBuf::from("Contents").join("Resources").join("app.asar.unpacked").join("extensions").join("antigravity").join("bin"),
         PathBuf::from("Contents").join("MacOS"),
     ];
 
@@ -274,9 +294,28 @@ pub fn find_targets_in_path(root: &Path) -> Vec<FoundTarget> {
     }
 
     let js_rel_candidates = [
-        PathBuf::from("resources").join("app").join("out").join("vs").join("code").join("electron-main").join("main.js"),
-        PathBuf::from("Contents").join("Resources").join("app").join("out").join("vs").join("code").join("electron-main").join("main.js"),
-        PathBuf::from("out").join("vs").join("code").join("electron-main").join("main.js"),
+        PathBuf::from("resources")
+            .join("app")
+            .join("out")
+            .join("vs")
+            .join("code")
+            .join("electron-main")
+            .join("main.js"),
+        PathBuf::from("Contents")
+            .join("Resources")
+            .join("app")
+            .join("out")
+            .join("vs")
+            .join("code")
+            .join("electron-main")
+            .join("main.js"),
+        PathBuf::from("resources").join("app").join("out").join("main.js"),
+        PathBuf::from("Contents").join("Resources").join("app").join("out").join("main.js"),
+        PathBuf::from("out")
+            .join("vs")
+            .join("code")
+            .join("electron-main")
+            .join("main.js"),
         PathBuf::from("dist").join("extension.js"),
         PathBuf::from("out").join("extension.js"),
         PathBuf::from("extension.js"),
@@ -308,8 +347,8 @@ pub fn find_targets_in_path(root: &Path) -> Vec<FoundTarget> {
         }
     }
 
-    // Shallow walk fallback (depth <= 4) for any unconventional subfolder
-    walk_targets(root, 0, 4, &mut targets);
+    // Walk fallback for any unconventional subfolder
+    walk_targets(root, 0, 8, &mut targets);
 
     targets
 }

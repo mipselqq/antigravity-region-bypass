@@ -100,7 +100,10 @@ pub fn apply_dns_rules() -> Result<String, String> {
         }
     }
     if studio_subs.is_empty() {
-        sub_notes.push("Studio/Gemini: нет (NRPT не ставим, браузер через VPN/ISP)".into());
+        sub_notes.push("Studio/Gemini: SmartDNS пропущен, используем Geohide SNI прокси".into());
+        for name in NRPT_STUDIO {
+            pending.push(((*name).to_string(), GEOHIDE_PROXY_V4.to_vec()));
+        }
     } else {
         sub_notes.push(format!("Studio/Gemini: {}", studio_subs.join(", ")));
         for name in NRPT_STUDIO {
@@ -158,8 +161,9 @@ pub fn apply_dns_rules() -> Result<String, String> {
             let _ = std::fs::create_dir_all(res_dir);
         }
         for (domain, csv) in &rules {
-            let file_path = res_dir.join(domain);
-            let mut content = format!("# ANTIGRAVITY-BYPASS-RUSSIA\n# {}\n", domain);
+            let clean_domain = domain.trim_start_matches('.');
+            let file_path = res_dir.join(clean_domain);
+            let mut content = format!("# ANTIGRAVITY-BYPASS-RUSSIA\n# {}\n", clean_domain);
             for ip in csv.split(';').filter(|s| !s.is_empty()) {
                 content.push_str(&format!("nameserver {}\n", ip));
             }

@@ -47,21 +47,52 @@ pub fn remove_all() {
 }
 
 fn appdata_settings(folder: &str) -> Option<PathBuf> {
-    let appdata = std::env::var("APPDATA").ok()?;
-    Some(PathBuf::from(appdata).join(folder).join("User").join("settings.json"))
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA").ok()?;
+        Some(PathBuf::from(appdata).join(folder).join("User").join("settings.json"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        for home in crate::system::env::get_user_homes() {
+            let p = home.join("Library").join("Application Support").join(folder).join("User").join("settings.json");
+            if p.parent().map(|d| d.exists()).unwrap_or(false) || p.exists() {
+                return Some(p);
+            }
+        }
+        let home = crate::system::env::expand_env_vars("~");
+        Some(home.join("Library").join("Application Support").join(folder).join("User").join("settings.json"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for home in crate::system::env::get_user_homes() {
+            let p = home.join(".config").join(folder).join("User").join("settings.json");
+            if p.parent().map(|d| d.exists()).unwrap_or(false) || p.exists() {
+                return Some(p);
+            }
+        }
+        let home = crate::system::env::expand_env_vars("~");
+        Some(home.join(".config").join(folder).join("User").join("settings.json"))
+    }
 }
 
 fn ide_settings_path(install: &Path) -> Option<PathBuf> {
-    let product = install.join("resources").join("app").join("product.json");
-    if let Ok(text) = fs::read_to_string(&product) {
-        if let Ok(re) = Regex::new(r#""nameShort"[ \t\r\n]*:[ \t\r\n]*"([^"]+)""#) {
-            if let Some(cap) = re.captures(&text) {
-                let name = cap.get(1)?.as_str();
-                return appdata_settings(name);
+    let product_candidates = [
+        install.join("resources").join("app").join("product.json"),
+        install.join("Contents").join("Resources").join("app").join("product.json"),
+        install.join("product.json"),
+    ];
+    for product in product_candidates {
+        if let Ok(text) = fs::read_to_string(&product) {
+            if let Ok(re) = Regex::new(r#""nameShort"[ \t\r\n]*:[ \t\r\n]*"([^"]+)""#) {
+                if let Some(cap) = re.captures(&text) {
+                    let name = cap.get(1)?.as_str();
+                    return appdata_settings(name);
+                }
             }
         }
     }
-    let fallbacks = ["Antigravity", "Antigravity IDE"];
+    let fallbacks = ["Antigravity", "Antigravity IDE", "Google Antigravity"];
     for f in fallbacks {
         if let Some(p) = appdata_settings(f) {
             if p.exists() {
@@ -69,7 +100,7 @@ fn ide_settings_path(install: &Path) -> Option<PathBuf> {
             }
         }
     }
-    None
+    appdata_settings("Antigravity")
 }
 
 fn build_reads_setting(install: &Path) -> bool {

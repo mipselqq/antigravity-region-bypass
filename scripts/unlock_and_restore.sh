@@ -93,9 +93,11 @@ ensure_admin() {
 # --- Process Killer (Batched single call) ---
 kill_antigravity_processes() {
     echo -e "${GRAY}Завершение запущенных процессов Antigravity...${NC}"
+    pkill -15 -f "Antigravity|language_server|agy|ag_dns" 2>/dev/null || true
     killall "Antigravity" "Antigravity IDE" "agy" "language_server_darwin_arm64" \
             "language_server_darwin_x64" "language_server" "ag_dns" 2>/dev/null || true
-    sleep 0.1
+    sleep 0.2
+    pkill -9 -f "Antigravity|language_server|agy|ag_dns" 2>/dev/null || true
 }
 
 # --- Cache Cleaner ---
@@ -303,8 +305,7 @@ restore_binary_py() {
     if [[ -f "$bak_path" && -s "$bak_path" ]]; then
         cp "$bak_path" "$file_path"
         rm -f "$bak_path"
-        codesign --force --sign - --preserve-metadata=entitlements,requirements,flags "$file_path" 2>/dev/null || true
-        echo "восстановлен из резервной копии (.bak)"
+        echo "восстановлен из резервной копии (.bak, оригинальная подпись сохранена)"
         return
     fi
 
@@ -612,7 +613,7 @@ main_menu() {
                         fi
                     done < <(find_targets "$inst")
                     if [[ "$inst" == *".app"* ]]; then
-                        codesign --force --deep --sign - --preserve-metadata=entitlements,requirements,flags "$inst" 2>/dev/null || true
+                        xattr -cr "$inst" 2>/dev/null || true
                     fi
                 done < <(find_installations)
 
@@ -645,7 +646,7 @@ main_menu() {
                         fi
                     done < <(find_targets "$inst")
                     if [[ "$inst" == *".app"* ]]; then
-                        codesign --force --deep --sign - --preserve-metadata=entitlements,requirements,flags "$inst" 2>/dev/null || true
+                        xattr -cr "$inst" 2>/dev/null || true
                     fi
                 done < <(find_installations)
                 read -rp "Нажмите Enter для продолжения..."
@@ -694,7 +695,7 @@ main_menu() {
                             fi
                         done < <(find_targets "$custom_path")
                         if [[ "$custom_path" == *".app"* ]]; then
-                            codesign --force --deep --sign - --preserve-metadata=entitlements,requirements,flags "$custom_path" 2>/dev/null || true
+                            xattr -cr "$custom_path" 2>/dev/null || true
                         fi
                     fi
                 else
