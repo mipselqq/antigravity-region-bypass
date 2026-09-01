@@ -49,8 +49,8 @@ const PROXY_SET_TTL: Duration = Duration::from_secs(30 * 60);
 const RACE_BUDGET: Duration = Duration::from_millis(700);
 const QUERY_TIMEOUT: Duration = Duration::from_millis(800);
 const LIVENESS_PORT: u16 = 443;
-const LIVENESS_BUDGET: Duration = Duration::from_millis(1200);
-const TLS_PROBE_BUDGET: Duration = Duration::from_millis(2500);
+const LIVENESS_BUDGET: Duration = Duration::from_millis(250);
+const TLS_PROBE_BUDGET: Duration = Duration::from_millis(1500);
 const LIVENESS_TTL_ALIVE: Duration = Duration::from_secs(10 * 60);
 const LIVENESS_TTL_DEAD: Duration = Duration::from_secs(60);
 
@@ -452,10 +452,20 @@ fn race_providers(query: &[u8], if_index: u32) -> (Vec<RaceResult>, Vec<IpAddr>)
     while Instant::now() < deadline {
         let remain = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remain) {
-            Ok(RaceMsg::Provider(hit)) => out.push(hit),
+            Ok(RaceMsg::Provider(hit)) => {
+                let has_addrs = !hit.addrs.is_empty();
+                out.push(hit);
+                // Early exit: as soon as we receive at least 1 provider with answers and reference (or 2 answers)
+                if has_addrs && (!reference.is_empty() || out.len() >= 2) {
+                    break;
+                }
+            }
             Ok(RaceMsg::Reference(addrs)) => {
                 if reference.is_empty() {
                     reference = addrs;
+                }
+                if !out.is_empty() {
+                    break;
                 }
             }
             Err(_) => break,
