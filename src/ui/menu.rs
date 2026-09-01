@@ -335,27 +335,87 @@ pub fn handle_diagnostics() {
     pause();
 }
 
+pub fn handle_proxy_menu() {
+    clear_screen();
+    banner();
+    println!("\x1b[96m=== ЛОКАЛЬНЫЙ HTTP / SOCKS5 ПРОКСИ И PAC ГЕНЕРАТОР ===\x1b[0m\n");
+
+    let http_port = crate::net::proxy::DEFAULT_HTTP_PROXY_PORT;
+    let socks5_port = crate::net::proxy::DEFAULT_SOCKS5_PROXY_PORT;
+
+    match crate::net::proxy::start_proxy_servers(http_port, socks5_port) {
+        Ok(()) => {
+            println!("\x1b[92m[✓] Локальные прокси-серверы успешно запущены:\x1b[0m");
+            println!("  • HTTP CONNECT прокси:  \x1b[96mhttp://127.0.0.1:{}\x1b[0m", http_port);
+            println!("  • SOCKS5 прокси:        \x1b[96msocks5://127.0.0.1:{}\x1b[0m", socks5_port);
+            println!("  • Dynamic PAC URL:      \x1b[93mhttp://127.0.0.1:{}/proxy.pac\x1b[0m\n", http_port);
+
+            println!("\x1b[90mСелективная маршрутизация активна: Google AI домены направляются через зарубежный SNI-релей, остальные напрямую.\x1b[0m\n");
+            println!("Как использовать в Antigravity IDE / VS Code / Терминале:");
+            println!("  \x1b[33msetx HTTP_PROXY \"http://127.0.0.1:{}\"\x1b[0m", http_port);
+            println!("  \x1b[33msetx HTTPS_PROXY \"http://127.0.0.1:{}\"\x1b[0m", http_port);
+            println!("  \x1b[33msetx ALL_PROXY \"socks5://127.0.0.1:{}\"\x1b[0m\n", socks5_port);
+        }
+        Err(e) => {
+            println!("\x1b[93m[i] {}\x1b[0m", e);
+        }
+    }
+    pause();
+}
+
+pub fn handle_watcher_menu() {
+    clear_screen();
+    banner();
+    println!("\x1b[95m=== АВТОМАТИЧЕСКИЙ РЕПАТЧЕР ПРИ ОБНОВЛЕНИЯХ (WATCHER) ===\x1b[0m\n");
+
+    println!("Выполняется мгновенный аудит и репатч...");
+    let count = crate::core::watcher::scan_and_repatch();
+    if count == 0 {
+        println!("\x1b[92m[✓] Все установленные бинарники и файлы Antigravity уже в пропатченном состоянии.\x1b[0m\n");
+    }
+
+    println!("1. Запустить фоновый мониторинг (проверка каждые 8 секунд в текущем окне)");
+    println!("2. Включить фоновый поток и вернуться в меню");
+    println!("0. Назад в главное меню\n");
+
+    match prompt("Выберите действие [0-2]: ").as_str() {
+        "1" => {
+            crate::core::watcher::run_watcher_loop(std::time::Duration::from_secs(8));
+        }
+        "2" => {
+            crate::core::watcher::spawn_watcher_thread(std::time::Duration::from_secs(8));
+            println!("\x1b[92m[✓] Фоновый поток мониторинга активен.\x1b[0m");
+            pause();
+        }
+        _ => {}
+    }
+}
+
 pub fn run_app() {
     loop {
         clear_screen();
         banner();
         print_dashboard();
 
-        println!("1. \x1b[92mПолная разблокировка\x1b[0m");
+        println!("1. \x1b[92mПолная разблокировка\x1b[0m (Файлы + SmartDNS)");
         println!("2. \x1b[94mТолько файлы\x1b[0m (Работа без смены страны аккаунта)");
         println!("3. \x1b[93mТолько DNS и сеть\x1b[0m (Работа без VPN)");
         println!("4. \x1b[95mУказать путь вручную\x1b[0m (к папке или файлу Antigravity)");
         println!("5. \x1b[96mДиагностика и проверка связи\x1b[0m");
         println!("6. \x1b[91mПОЛНЫЙ ОТКАТ\x1b[0m (вернуть всё в исходное состояние)");
+        println!("7. \x1b[96mЛокальный HTTP/SOCKS5 прокси и PAC\x1b[0m (без смены системных DNS)");
+        println!("8. \x1b[95mФоновый репатчер обновлений (Watcher)\x1b[0m");
         println!("0. Выход\n");
 
-        match prompt("Выберите действие [0-6]: ").as_str() {
+        match prompt("Выберите действие [0-8]: ").as_str() {
             "1" => handle_unlock_all(),
             "2" => handle_patch_files_only(),
             "3" => handle_dns_only(),
             "4" => handle_manual_path(),
             "5" => handle_diagnostics(),
             "6" => handle_rollback(),
+            "7" => handle_proxy_menu(),
+            "8" => handle_watcher_menu(),
             "0" => {
                 clear_screen();
                 break;

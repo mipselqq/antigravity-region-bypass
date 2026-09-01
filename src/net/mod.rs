@@ -5,6 +5,7 @@ pub mod health;
 pub mod hosts;
 pub mod nrpt;
 pub mod provider;
+pub mod proxy;
 pub mod rank;
 pub mod relay;
 pub mod resolvers;
