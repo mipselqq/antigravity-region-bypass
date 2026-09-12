@@ -97,7 +97,7 @@ jobs:
             dist/antigravity-bypass-russia.exe
             dist/unlock_and_restore.ps1
             dist/unlock_and_restore.sh
-          body_path: RELEASE_NOTES_1.3.0.md
+          body: Улучшили интерфейс и работу обхода. Исправили ошибки и повысили стабильность.
           draft: true
           generate_release_notes: false
           append_body: false
