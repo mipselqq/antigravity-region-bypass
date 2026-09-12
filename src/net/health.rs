@@ -240,6 +240,22 @@ pub fn probe_all() -> Vec<ConnReport> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    // Generate a short-lived localhost identity for this test process only.
+    // No OS trust changes, committed private key, or future expiry date to maintain.
+    pub(crate) fn identity() -> &'static (Vec<u8>, Vec<u8>) {
+        static IDENTITY: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+        IDENTITY.get_or_init(|| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+            let now = time::OffsetDateTime::now_utc();
+            params.not_before = now - time::Duration::days(1);
+            params.not_after = now + time::Duration::days(14);
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+            let cert = params.self_signed(&key).unwrap();
+            (cert.der().to_vec(), key.serialize_der())
+        })
+    }
     pub(crate) fn server(
         reply: Vec<u8>,
         delay: Duration,
@@ -247,12 +263,8 @@ pub(crate) mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
-            let cert = rustls::pki_types::CertificateDer::from(
-                include_bytes!("../../tests/fixtures/localhost-cert.der").to_vec(),
-            );
-            let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
-                include_bytes!("../../tests/fixtures/localhost-key.der").to_vec(),
-            );
+            let cert = rustls::pki_types::CertificateDer::from(identity().0.clone());
+            let key = rustls::pki_types::PrivatePkcs8KeyDer::from(identity().1.clone());
             let config = rustls::ServerConfig::builder()
                 .with_no_client_auth()
                 .with_single_cert(vec![cert], key.into())
@@ -299,10 +311,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn real_tls_fragmented_http_and_total_deadline_are_checked_without_os_trust_changes() {
-        let cert = native_tls::Certificate::from_der(include_bytes!(
-            "../../tests/fixtures/localhost-cert.der"
-        ))
-        .unwrap();
+        let cert = native_tls::Certificate::from_der(&identity().0).unwrap();
         let trusted = TlsConnector::builder()
             .add_root_certificate(cert)
             .build()

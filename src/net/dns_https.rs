@@ -166,10 +166,8 @@ mod tests {
         let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", answer.len()).into_bytes();
         response.extend_from_slice(&answer);
         let (addr, server) = super::super::health::tests::server(response, Duration::ZERO);
-        let cert = reqwest::Certificate::from_der(include_bytes!(
-            "../../tests/fixtures/localhost-cert.der"
-        ))
-        .unwrap();
+        let cert =
+            reqwest::Certificate::from_der(&super::super::health::tests::identity().0).unwrap();
         let client = Client::builder()
             .no_proxy()
             .add_root_certificate(cert)
