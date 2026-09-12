@@ -580,8 +580,8 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<ResolveHit> {
         }
     }
     let (mut hits, reference) = race_providers(query, if_index);
-    // The relay replaces our hosts pins, including verified seed routes when
-    // SmartDNS returns ordinary Google addresses (for example behind a VPN).
+    // Direct relay queries also use verified seed routes when SmartDNS returns
+    // ordinary Google addresses (for example behind a VPN).
     if super::provider::NRPT_AGENT.contains(&name.as_str()) {
         if let Some(hit) = ranked_hit(query, &ranked) {
             hits.push(hit);

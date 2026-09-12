@@ -184,10 +184,8 @@ pub fn apply_dns_rules() -> Result<String, String> {
             "процесс запущен, но DNS-проверка не прошла; сохранены резервные адреса".into();
     }
     let mut rules: Vec<(String, String)> = Vec::new();
-    if relay_ok {
-        // Static hosts must not hide the adaptive relay from the client.
-        hosts::remove_entries()?;
-    }
+    // Keep verified agent addresses installed by rescan_agent. A VPN enabled
+    // later may intercept loopback DNS even while the relay remains healthy.
     for (name, subs) in &pending {
         if !rules.iter().any(|(n, _)| n == name) {
             rules.push((name.clone(), assemble_nameservers(relay_ok, subs)));

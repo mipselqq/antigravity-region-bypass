@@ -2,7 +2,7 @@
 //!
 //! Discovery runs at unlock and in the background. The relay serves fresh
 //! ranked routes immediately and probes stale candidates before using them.
-//! Static hosts pins are retained only if the adaptive relay cannot start.
+//! Verified agent hosts pins keep IDE/CLI independent of loopback DNS interception.
 
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
@@ -175,10 +175,7 @@ fn rescan(if_index: u32, manage_system: bool) -> Result<Vec<RankedHost>, String>
     validate_ranked(&ranked)?;
     save(&ranked)?;
     if manage_system {
-        // The running relay must own answers; hosts entries would bypass its health/region decisions.
-        if !std::env::args().any(|a| a == crate::system::service::FORWARDER_FLAG) {
-            apply_hosts(&ranked)?;
-        }
+        apply_hosts(&ranked)?;
         routes::sync_physical_hosts(&ranked_ips(&ranked))?;
     }
     Ok(ranked)
@@ -326,11 +323,16 @@ fn refresh_routes_from_disk() {
     }
 }
 
-fn apply_hosts(ranked: &[RankedHost]) -> Result<(), String> {
-    let entries: Vec<_> = ranked
+fn hosts_entries(ranked: &[RankedHost]) -> Vec<(String, Ipv4Addr)> {
+    ranked
         .iter()
-        .flat_map(|h| h.ips.iter().map(move |(ip, _)| (h.host.clone(), *ip)))
-        .collect();
+        // Match 2.0.0: one verified leader per host, avoiding slow fallback races.
+        .filter_map(|h| h.ips.first().map(|(ip, _)| (h.host.clone(), *ip)))
+        .collect()
+}
+
+fn apply_hosts(ranked: &[RankedHost]) -> Result<(), String> {
+    let entries = hosts_entries(ranked);
     if entries.is_empty() {
         crate::net::hosts::remove_entries()
     } else {
@@ -391,6 +393,33 @@ fn load() -> Vec<RankedHost> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hosts_pins_follow_verified_leaders_and_skip_unreachable_hosts() {
+        let first = Ipv4Addr::new(192, 0, 2, 1);
+        let second = Ipv4Addr::new(192, 0, 2, 2);
+        let mut ranked = vec![
+            RankedHost {
+                host: "daily-cloudcode-pa.googleapis.com".into(),
+                ips: vec![(first, 10), (second, 20)],
+            },
+            RankedHost {
+                host: "cloudcode-pa.googleapis.com".into(),
+                ips: vec![],
+            },
+        ];
+        assert_eq!(
+            hosts_entries(&ranked),
+            vec![(ranked[0].host.clone(), first)]
+        );
+        ranked[0].ips.remove(0);
+        assert_eq!(
+            hosts_entries(&ranked),
+            vec![(ranked[0].host.clone(), second)]
+        );
+        ranked[0].ips.clear();
+        assert!(hosts_entries(&ranked).is_empty());
+    }
+
     #[test]
     fn failed_cloudcode_scan_is_rejected_before_persistence() {
         assert!(validate_ranked(&[]).is_err());
