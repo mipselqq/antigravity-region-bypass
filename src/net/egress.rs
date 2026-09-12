@@ -1,5 +1,5 @@
-use std::process::Command;
 use crate::system::process::no_window;
+use std::process::Command;
 
 pub struct Egress {
     pub if_index: u32,
@@ -8,19 +8,11 @@ pub struct Egress {
     pub vpn_active: bool,
 }
 
-const LEGACY_PINNED_PREFIXES: &[&str] = &[
-    "178.130.155.0/24",
-    "185.158.113.0/24",
-    "185.158.114.0/24",
-    "82.148.16.0/24",
-    "82.148.17.0/24",
-    "82.148.18.0/24",
-    "82.148.19.0/24",
-];
-
 const VPN_KEYWORDS: &[&str] = &[
     "wireguard",
     "wintun",
+    "sing-tun",
+    "throne",
     "tap-windows",
     "tap-win",
     "openvpn",
@@ -44,6 +36,96 @@ const VPN_KEYWORDS: &[&str] = &[
 fn descr_is_vpn(descr: &str) -> bool {
     let d = descr.to_lowercase();
     VPN_KEYWORDS.iter().any(|k| d.contains(k))
+}
+
+/// Read-only preflight; call before patching files or changing network state.
+pub fn ensure_tun_disabled() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let script = r#"$ErrorActionPreference='Stop'; ConvertTo-Json -Compress -InputObject @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and -not $_.HardwareInterface } | ForEach-Object { $_.Name + '|' + $_.InterfaceDescription })"#;
+        let output = no_window(&mut Command::new("powershell.exe"))
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .map_err(|e| format!("Не удалось проверить режим TUN: {e}"))?;
+        if !output.status.success() {
+            return Err("Не удалось проверить сетевые адаптеры. Выключите VPN и режим TUN и повторите запуск.".into());
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let adapters: Vec<String> = if text.trim().is_empty() {
+            vec![]
+        } else {
+            serde_json::from_str(&text).map_err(|e| format!("Проверка TUN: {e}"))?
+        };
+        if adapters.iter().any(|name| is_active_tun_name(name)) {
+            return Err("Обнаружен включённый TUN. Выключите VPN и режим TUN в VPN-клиенте, затем повторите включение обхода.".into());
+        }
+        // Also catches unfamiliar TUN clients whose DNS protection remains on.
+        if !super::relay::local_dns_available()? {
+            return Err("Локальный DNS заблокирован. Выключите VPN вместе с режимом TUN, затем повторите включение обхода.".into());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let egress = detect().ok_or("Не удалось определить подключение к интернету. Проверьте сеть и повторите включение обхода.")?;
+        if egress.vpn_active {
+            return Err("Выключите VPN и режим TUN, затем повторите включение обхода.".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn is_active_tun_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    // An always-on overlay alone (e.g. Tailscale) is not evidence of TUN
+    // interception. Port-53 protection is checked separately above.
+    if name.contains("tailscale") || name.contains("zerotier") {
+        return false;
+    }
+    [
+        "sing-tun",
+        "throne",
+        "wintun",
+        "wireguard",
+        "tap-windows",
+        "tap-win",
+        "openvpn",
+        "tun2socks",
+        "clash",
+        "mihomo",
+        "warp",
+        "nordlynx",
+        "proton",
+        "outline",
+    ]
+    .iter()
+    .any(|pattern| name.contains(pattern))
+        || name
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|part| part == "tun")
+}
+
+#[cfg(test)]
+mod tun_preflight_tests {
+    #[test]
+    fn detects_throne_and_tun_clients_but_not_unrelated_overlays() {
+        for name in [
+            "throne-tun|sing-tun Tunnel",
+            "VPN|Wintun Userspace Tunnel",
+            "tun0|WireGuard Tunnel",
+            "tun|VPN Adapter",
+        ] {
+            assert!(super::is_active_tun_name(name), "{name}");
+        }
+        for name in [
+            "Tailscale|Tailscale Tunnel",
+            "ZeroTier One",
+            "Ethernet|Realtek",
+            "vEthernet|Hyper-V Virtual Ethernet Adapter",
+        ] {
+            assert!(!super::is_active_tun_name(name), "{name}");
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -101,7 +183,10 @@ fn is_vpn_iface(if_index: u32) -> bool {
     const IF_TYPE_PROP_VIRTUAL: u32 = 53;
     match if_entry_meta(if_index) {
         Some((ty, descr)) => {
-            ty == IF_TYPE_PPP || ty == IF_TYPE_TUNNEL || ty == IF_TYPE_PROP_VIRTUAL || descr_is_vpn(&descr)
+            ty == IF_TYPE_PPP
+                || ty == IF_TYPE_TUNNEL
+                || ty == IF_TYPE_PROP_VIRTUAL
+                || descr_is_vpn(&descr)
         }
         None => false,
     }
@@ -131,11 +216,17 @@ pub fn detect_physical() -> Option<(u32, String)> {
             }
             #[link(name = "iphlpapi")]
             extern "system" {
-                fn GetBestRoute(dwDestAddr: u32, dwSourceAddr: u32, pBestRoute: *mut MibIpForwardRow) -> u32;
+                fn GetBestRoute(
+                    dwDestAddr: u32,
+                    dwSourceAddr: u32,
+                    pBestRoute: *mut MibIpForwardRow,
+                ) -> u32;
             }
             let mut row: MibIpForwardRow = unsafe { std::mem::zeroed() };
             let dest: u32 = u32::from_ne_bytes([8, 8, 8, 8]);
-            if unsafe { GetBestRoute(dest, 0, &mut row) } == 0 && !is_vpn_iface(row.dw_forward_if_index) {
+            if unsafe { GetBestRoute(dest, 0, &mut row) } == 0
+                && !is_vpn_iface(row.dw_forward_if_index)
+            {
                 let gw = row.dw_forward_next_hop.to_ne_bytes();
                 if gw != [0, 0, 0, 0] {
                     Some((
@@ -156,7 +247,7 @@ pub fn detect_physical() -> Option<(u32, String)> {
         let ps = r#"
 $vpn = 'WireGuard|TAP|Wintun|OpenVPN|Tailscale|Cisco|GlobalProtect|PANGP|ZeroTier|Hamachi|Cloudflare|WARP|NordLynx|Proton|Outline|SoftEther|tun2socks'
 $phys = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
-    $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch $vpn -and $_.InterfaceDescription -notmatch 'Hyper-V|VMware|VirtualBox|WSL'
+    $_.Status -eq 'Up' -and $_.HardwareInterface -and $_.InterfaceDescription -notmatch $vpn -and $_.InterfaceDescription -notmatch 'Hyper-V|VMware|VirtualBox|WSL'
 } | ForEach-Object { $_.ifIndex })
 $def = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
 $mine = @($def | Where-Object { $phys -contains $_.ifIndex -and $_.NextHop -ne '0.0.0.0' })
@@ -198,7 +289,11 @@ if ($mine.Count -gt 0) {
         }
         #[link(name = "iphlpapi")]
         extern "system" {
-            fn GetBestRoute(dwDestAddr: u32, dwSourceAddr: u32, pBestRoute: *mut MibIpForwardRow) -> u32;
+            fn GetBestRoute(
+                dwDestAddr: u32,
+                dwSourceAddr: u32,
+                pBestRoute: *mut MibIpForwardRow,
+            ) -> u32;
         }
         let mut row: MibIpForwardRow = unsafe { std::mem::zeroed() };
         let dest: u32 = u32::from_ne_bytes([8, 8, 8, 8]);
@@ -220,10 +315,13 @@ if ($mine.Count -gt 0) {
 
     #[cfg(target_os = "macos")]
     {
-        let out = Command::new("route")
-            .args(["-n", "get", "default"])
+        let out = Command::new("/sbin/route")
+            .args(["-n", "get", "8.8.8.8"])
             .output()
             .ok()?;
+        if !out.status.success() {
+            return None;
+        }
         let txt = String::from_utf8_lossy(&out.stdout);
         let mut if_name = String::new();
         let mut gateway = String::new();
@@ -287,10 +385,14 @@ pub fn detect() -> Option<Egress> {
 
     #[cfg(target_os = "macos")]
     {
-        let out = Command::new("route")
-            .args(["-n", "get", "default"])
+        // A VPN can install /1 routes while leaving the physical default intact.
+        let out = Command::new("/sbin/route")
+            .args(["-n", "get", "8.8.8.8"])
             .output()
             .ok()?;
+        if !out.status.success() {
+            return None;
+        }
         let txt = String::from_utf8_lossy(&out.stdout);
 
         let mut if_name = String::new();
@@ -318,7 +420,11 @@ pub fn detect() -> Option<Egress> {
         if idx > 0 {
             Some(Egress {
                 if_index: idx,
-                gateway: if gateway.is_empty() { None } else { Some(gateway) },
+                gateway: if gateway.is_empty() {
+                    None
+                } else {
+                    Some(gateway)
+                },
                 vpn_active: vpn,
             })
         } else {
@@ -328,16 +434,4 @@ pub fn detect() -> Option<Egress> {
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     None
-}
-
-pub fn remove_legacy_routes() {
-    #[cfg(target_os = "windows")]
-    {
-        for pfx in LEGACY_PINNED_PREFIXES {
-            let ip_only = pfx.split('/').next().unwrap_or(pfx);
-            let _ = no_window(&mut Command::new("route"))
-                .args(["delete", ip_only])
-                .output();
-        }
-    }
 }

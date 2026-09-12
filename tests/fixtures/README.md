@@ -1,0 +1,1 @@
+Local TLS test fixture only. The public test key authenticates localhost in isolated tests; the certificate is trusted only by the test connector, never installed in the OS trust store. Valid 2020–2120.

@@ -20,9 +20,21 @@ mod win_sock {
 
     #[link(name = "ws2_32")]
     extern "system" {
-        pub fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+        pub fn setsockopt(
+            s: usize,
+            level: i32,
+            optname: i32,
+            optval: *const u8,
+            optlen: i32,
+        ) -> i32;
         #[allow(dead_code)]
-        pub fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32) -> i32;
+        pub fn getsockopt(
+            s: usize,
+            level: i32,
+            optname: i32,
+            optval: *mut u8,
+            optlen: *mut i32,
+        ) -> i32;
         pub fn WSAGetLastError() -> i32;
     }
 
@@ -30,7 +42,11 @@ mod win_sock {
     pub const SO_RCVBUF: i32 = 0x1002;
     pub const SO_SNDBUF: i32 = 0x1001;
 
-    pub fn set_socket_buffer_with_fallback(raw: RawSocket, optname: i32, target_size: i32) -> Result<(), String> {
+    pub fn set_socket_buffer_with_fallback(
+        raw: RawSocket,
+        optname: i32,
+        target_size: i32,
+    ) -> Result<(), String> {
         let handle = raw as usize;
         let fallbacks = [target_size, 256 * 1024, 128 * 1024, 64 * 1024];
         let mut last_err = 0;
@@ -57,7 +73,15 @@ mod win_sock {
         let handle = raw as usize;
         let mut buf_size: i32 = 0;
         let mut len: i32 = 4;
-        let ret = unsafe { getsockopt(handle, SOL_SOCKET, optname, &mut buf_size as *mut _ as *mut u8, &mut len) };
+        let ret = unsafe {
+            getsockopt(
+                handle,
+                SOL_SOCKET,
+                optname,
+                &mut buf_size as *mut _ as *mut u8,
+                &mut len,
+            )
+        };
         if ret == 0 {
             Ok(buf_size)
         } else {
@@ -71,7 +95,11 @@ mod win_sock {
 mod unix_sock {
     use std::os::unix::io::RawFd;
 
-    pub fn set_socket_buffer_with_fallback(fd: RawFd, optname: libc::c_int, target_size: i32) -> Result<(), String> {
+    pub fn set_socket_buffer_with_fallback(
+        fd: RawFd,
+        optname: libc::c_int,
+        target_size: i32,
+    ) -> Result<(), String> {
         let fallbacks = [target_size, 256 * 1024, 128 * 1024, 64 * 1024];
         let mut last_errno = 0;
 
@@ -105,12 +133,21 @@ mod unix_sock {
         let mut size: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         let ret = unsafe {
-            libc::getsockopt(fd, libc::SOL_SOCKET, optname, &mut size as *mut _ as *mut libc::c_void, &mut len)
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                optname,
+                &mut size as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
         };
         if ret == 0 {
             Ok(size as i32)
         } else {
-            Err(format!("getsockopt failed: errno {}", std::io::Error::last_os_error()))
+            Err(format!(
+                "getsockopt failed: errno {}",
+                std::io::Error::last_os_error()
+            ))
         }
     }
 }
@@ -156,7 +193,9 @@ pub fn get_stream_buffer_sizes(stream: &TcpStream) -> Result<(i32, i32), String>
 /// 2. Sets SO_RCVBUF = 512 KB with graceful OS fallback ladder (512KB -> 256KB -> 128KB -> 64KB).
 /// 3. Sets SO_SNDBUF = 512 KB with graceful OS fallback ladder (512KB -> 256KB -> 128KB -> 64KB).
 pub fn configure_tcp_stream(stream: &TcpStream) -> Result<(), String> {
-    stream.set_nodelay(true).map_err(|e| format!("Failed to set TCP_NODELAY: {}", e))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|e| format!("Failed to set TCP_NODELAY: {}", e))?;
 
     #[cfg(target_os = "windows")]
     {
@@ -221,7 +260,13 @@ pub fn bind_socket_to_interface(sock: &UdpSocket, if_index: u32) -> Result<(), S
         use std::os::windows::io::AsRawSocket;
         #[link(name = "ws2_32")]
         extern "system" {
-            fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+            fn setsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *const u8,
+                optlen: i32,
+            ) -> i32;
         }
         let raw = sock.as_raw_socket() as usize;
         let be = if_index.to_be();
@@ -266,7 +311,13 @@ pub fn set_socket_buffers(sock: &UdpSocket, size: i32) -> Result<(), String> {
         use std::os::windows::io::AsRawSocket;
         #[link(name = "ws2_32")]
         extern "system" {
-            fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+            fn setsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *const u8,
+                optlen: i32,
+            ) -> i32;
         }
         const SOL_SOCKET: i32 = 0xFFFF;
         const SO_RCVBUF: i32 = 0x1002;
@@ -333,22 +384,52 @@ pub fn get_os_network_status() -> String {
                 if let Some((_, val)) = line.split_once(':') {
                     let v = val.trim();
                     let v_lower = v.to_lowercase();
-                    if line_lower.contains("autotuning") || line_lower.contains("автонастро") {
-                        let note = if v_lower == "normal" { " [optimal]" } else { " [suboptimal: recommend normal]" };
+                    if line_lower.contains("autotuning") || line_lower.contains("автонастро")
+                    {
+                        let note = if v_lower == "normal" {
+                            " [optimal]"
+                        } else {
+                            " [suboptimal: recommend normal]"
+                        };
                         lines.push(format!("  - Receive Window Auto-Tuning: {}{}", v, note));
-                    } else if line_lower.contains("receive-side scaling") || line_lower.contains("масштабирования на стороне приема") {
-                        let note = if v_lower == "enabled" { " [optimal]" } else { " [disabled]" };
+                    } else if line_lower.contains("receive-side scaling")
+                        || line_lower.contains("масштабирования на стороне приема")
+                    {
+                        let note = if v_lower == "enabled" {
+                            " [optimal]"
+                        } else {
+                            " [disabled]"
+                        };
                         lines.push(format!("  - Receive-Side Scaling (RSS): {}{}", v, note));
-                    } else if line_lower.contains("fast open") && !line_lower.contains("откат") && !line_lower.contains("fallback") {
-                        let note = if v_lower == "enabled" { " [optimal]" } else { " [disabled]" };
+                    } else if line_lower.contains("fast open")
+                        && !line_lower.contains("откат")
+                        && !line_lower.contains("fallback")
+                    {
+                        let note = if v_lower == "enabled" {
+                            " [optimal]"
+                        } else {
+                            " [disabled]"
+                        };
                         lines.push(format!("  - TCP Fast Open (TFO): {}{}", v, note));
                     } else if line_lower.contains("hystart") {
-                        let note = if v_lower == "enabled" { " [optimal]" } else { " [disabled]" };
+                        let note = if v_lower == "enabled" {
+                            " [optimal]"
+                        } else {
+                            " [disabled]"
+                        };
                         lines.push(format!("  - HyStart Slow-Start: {}{}", v, note));
-                    } else if line_lower.contains("proportional rate") || line_lower.contains("коэффициента пропорции") {
-                        let note = if v_lower == "enabled" { " [optimal]" } else { " [disabled]" };
+                    } else if line_lower.contains("proportional rate")
+                        || line_lower.contains("коэффициента пропорции")
+                    {
+                        let note = if v_lower == "enabled" {
+                            " [optimal]"
+                        } else {
+                            " [disabled]"
+                        };
                         lines.push(format!("  - Proportional Rate Reduction: {}{}", v, note));
-                    } else if line_lower.contains("timestamps") || line_lower.contains("метки времени") {
+                    } else if line_lower.contains("timestamps")
+                        || line_lower.contains("метки времени")
+                    {
                         lines.push(format!("  - RFC 1323 Timestamps: {}", v));
                     }
                 }
@@ -362,10 +443,16 @@ pub fn get_os_network_status() -> String {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let line_lower = line.to_lowercase();
-                if (line_lower.contains("heuristic") || line_lower.contains("эвристик")) && line.contains(':') {
+                if (line_lower.contains("heuristic") || line_lower.contains("эвристик"))
+                    && line.contains(':')
+                {
                     if let Some((_, val)) = line.split_once(':') {
                         let v = val.trim();
-                        let note = if v.to_lowercase() == "disabled" { " [optimal]" } else { " [enabled - may throttle TCP]" };
+                        let note = if v.to_lowercase() == "disabled" {
+                            " [optimal]"
+                        } else {
+                            " [enabled - may throttle TCP]"
+                        };
                         lines.push(format!("  - Window Scaling Heuristics: {}{}", v, note));
                         break;
                     }
@@ -424,337 +511,351 @@ pub fn get_os_network_status() -> String {
 }
 
 /// Applies OS-level network stack fine-tuning (TCP window auto-tuning, RSS, Fast Open, etc.).
-/// Backs up pre-existing settings to `tcp_backup.conf` if not already present.
-pub fn tune_os_network_stack() -> Result<Vec<String>, String> {
-    if !crate::system::privilege::is_admin() {
-        return Err("Administrative privileges required to tune OS network stack".to_string());
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let mut applied = Vec::new();
-        let bpath = tcp_backup_path();
-
-        if !bpath.exists() {
-            if let Some(parent) = bpath.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let backup_content = capture_windows_tcp_backup();
-            let _ = fs::write(&bpath, backup_content);
-        }
-
-        let netsh_cmds: &[(&str, &[&str], &str)] = &[
-            ("autotuninglevel", &["int", "tcp", "set", "global", "autotuninglevel=normal"], "Receive Window Auto-Tuning Level: normal"),
-            ("heuristics", &["int", "tcp", "set", "heuristics", "disabled"], "TCP Window Scaling Heuristics: disabled"),
-            ("rss", &["int", "tcp", "set", "global", "rss=enabled"], "Receive-Side Scaling (RSS): enabled"),
-            ("fastopen", &["int", "tcp", "set", "global", "fastopen=enabled"], "TCP Fast Open (TFO): enabled"),
-            ("hystart", &["int", "tcp", "set", "global", "hystart=enabled"], "HyStart Congestion Optimization: enabled"),
-            ("prr", &["int", "tcp", "set", "global", "prr=enabled"], "Proportional Rate Reduction (PRR): enabled"),
-            ("timestamps", &["int", "tcp", "set", "global", "timestamps=allowed"], "RFC 1323 Timestamps: allowed"),
-            ("rsc", &["int", "tcp", "set", "global", "rsc=enabled"], "Receive Segment Coalescing (RSC): enabled"),
-            ("congestion_internet", &["int", "tcp", "set", "supplemental", "template=internet", "congestionprovider=cubic"], "TCP Congestion Provider (Internet): CUBIC"),
-            ("congestion_custom", &["int", "tcp", "set", "supplemental", "template=internetcustom", "congestionprovider=cubic"], "TCP Congestion Provider (InternetCustom): CUBIC"),
-            ("ecn", &["int", "tcp", "set", "global", "ecncapability=enabled"], "Explicit Congestion Notification (ECN): enabled"),
-            ("initialrto", &["int", "tcp", "set", "global", "initialRto=2000"], "Initial Retransmission Timeout (initialRTO): 2000ms"),
-        ];
-
-        let mut success_count = 0;
-        for (_key, args, desc) in netsh_cmds {
-            let res = crate::system::process::no_window(&mut Command::new("netsh"))
-                .args(*args)
-                .output();
-            if let Ok(output) = res {
-                let out = String::from_utf8_lossy(&output.stdout);
-                if output.status.success() || out.to_lowercase().contains("ok") || out.contains("ОК") {
-                    applied.push(desc.to_string());
-                    success_count += 1;
-                }
-            }
-        }
-
-        if success_count == 0 {
-            return Err("Failed to apply Windows netsh TCP stack configuration".to_string());
-        }
-
-        Ok(applied)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let mut applied = Vec::new();
-        let bpath = tcp_backup_path();
-
-        if !bpath.exists() {
-            if let Some(parent) = bpath.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let backup_content = capture_macos_sysctl_backup();
-            let _ = fs::write(&bpath, backup_content);
-        }
-
-        let tunables = [
-            ("net.inet.tcp.autorcvbufmax=16777216", "TCP Auto-Receive Buffer Max: 16 MB (16777216)"),
-            ("net.inet.tcp.autosndbufmax=16777216", "TCP Auto-Send Buffer Max: 16 MB (16777216)"),
-            ("net.inet.tcp.autorcvbuf=1", "TCP Dynamic Receive Auto-Tuning: enabled (1)"),
-            ("net.inet.tcp.autosndbuf=1", "TCP Dynamic Send Auto-Tuning: enabled (1)"),
-            ("net.inet.tcp.sendspace=524288", "TCP Send Buffer Space: 512 KB (524288)"),
-            ("net.inet.tcp.recvspace=524288", "TCP Recv Buffer Space: 512 KB (524288)"),
-            ("kern.ipc.maxsockbuf=16777216", "Kernel Max Socket Buffer: 16 MB (16777216)"),
-            ("net.inet.tcp.fastopen=3", "TCP Fast Open (Client+Server): enabled (3)"),
-        ];
-
-        for (cmd_arg, desc) in &tunables {
-            let res = Command::new("sysctl")
-                .arg("-w")
-                .arg(cmd_arg)
-                .output();
-            if let Ok(out) = res {
-                if out.status.success() {
-                    applied.push(desc.to_string());
-                }
-            }
-        }
-
-        if applied.is_empty() {
-            return Err("Failed to apply macOS sysctl network parameters".to_string());
-        }
-
-        Ok(applied)
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let mut applied = Vec::new();
-        let tunables = [
-            ("net.ipv4.tcp_window_scaling=1", "TCP Window Scaling: enabled (1)"),
-            ("net.ipv4.tcp_rmem=4096 87380 16777216", "TCP RCV Buffers: 4KB / 87KB / 16MB"),
-            ("net.ipv4.tcp_wmem=4096 65536 16777216", "TCP SND Buffers: 4KB / 64KB / 16MB"),
-            ("net.core.rmem_max=16777216", "Core Max RCV Buffer: 16 MB"),
-            ("net.core.wmem_max=16777216", "Core Max SND Buffer: 16 MB"),
-            ("net.ipv4.tcp_fastopen=3", "TCP Fast Open: enabled (3)"),
-        ];
-        for (cmd_arg, desc) in &tunables {
-            if let Ok(out) = Command::new("sysctl").arg("-w").arg(cmd_arg).output() {
-                if out.status.success() {
-                    applied.push(desc.to_string());
-                }
-            }
-        }
-        Ok(applied)
-    }
-
-    #[cfg(not(any(target_os = "windows", unix)))]
-    {
-        Ok(vec!["OS network tuning not supported on this platform".to_string()])
-    }
+/// Backs up every modified setting to `tcp_snapshot.json` before any writes.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TcpSnapshot {
+    platform: String,
+    original: std::collections::BTreeMap<String, String>,
 }
 
-/// Restores OS-level network stack settings using `tcp_backup.conf` (or factory defaults).
-pub fn restore_os_network_stack() -> Result<Vec<String>, String> {
-    if !crate::system::privilege::is_admin() {
-        return Err("Administrative privileges required to restore OS network stack".to_string());
-    }
-
+fn tcp_tunables() -> &'static [(&'static str, &'static str)] {
     #[cfg(target_os = "windows")]
     {
-        let mut restored = Vec::new();
-        let bpath = tcp_backup_path();
-
-        let mut backup_map = std::collections::HashMap::new();
-        if bpath.exists() {
-            if let Ok(content) = fs::read_to_string(&bpath) {
-                for line in content.lines() {
-                    if let Some((k, v)) = line.split_once('=') {
-                        backup_map.insert(k.trim().to_string(), v.trim().to_string());
-                    }
-                }
-            }
-        }
-
-        let autotuning = backup_map.get("autotuninglevel").map(|s| s.as_str()).unwrap_or("normal");
-        let heuristics = backup_map.get("heuristics").map(|s| s.as_str()).unwrap_or("default");
-        let rss = backup_map.get("rss").map(|s| s.as_str()).unwrap_or("default");
-        let fastopen = backup_map.get("fastopen").map(|s| s.as_str()).unwrap_or("default");
-        let hystart = backup_map.get("hystart").map(|s| s.as_str()).unwrap_or("default");
-        let prr = backup_map.get("prr").map(|s| s.as_str()).unwrap_or("default");
-        let timestamps = backup_map.get("timestamps").map(|s| s.as_str()).unwrap_or("default");
-        let rsc = backup_map.get("rsc").map(|s| s.as_str()).unwrap_or("default");
-
-        let autotuning_arg = format!("autotuninglevel={}", autotuning);
-        let rss_arg = format!("rss={}", rss);
-        let fastopen_arg = format!("fastopen={}", fastopen);
-        let hystart_arg = format!("hystart={}", hystart);
-        let prr_arg = format!("prr={}", prr);
-        let timestamps_arg = format!("timestamps={}", timestamps);
-        let rsc_arg = format!("rsc={}", rsc);
-
-        let restore_cmds: &[(&str, &[&str], &str)] = &[
-            ("autotuninglevel", &["int", "tcp", "set", "global", &autotuning_arg], "Receive Window Auto-Tuning Level restored"),
-            ("heuristics", &["int", "tcp", "set", "heuristics", heuristics], "TCP Window Scaling Heuristics restored"),
-            ("rss", &["int", "tcp", "set", "global", &rss_arg], "Receive-Side Scaling (RSS) restored"),
-            ("fastopen", &["int", "tcp", "set", "global", &fastopen_arg], "TCP Fast Open (TFO) restored"),
-            ("hystart", &["int", "tcp", "set", "global", &hystart_arg], "HyStart restored"),
-            ("prr", &["int", "tcp", "set", "global", &prr_arg], "PRR restored"),
-            ("timestamps", &["int", "tcp", "set", "global", &timestamps_arg], "RFC 1323 Timestamps restored"),
-            ("rsc", &["int", "tcp", "set", "global", &rsc_arg], "RSC restored"),
-            ("congestion_internet", &["int", "tcp", "set", "supplemental", "template=internet", "congestionprovider=default"], "TCP Congestion Provider (Internet) restored"),
-            ("congestion_custom", &["int", "tcp", "set", "supplemental", "template=internetcustom", "congestionprovider=default"], "TCP Congestion Provider (InternetCustom) restored"),
-            ("ecn", &["int", "tcp", "set", "global", "ecncapability=disabled"], "ECN restored"),
-            ("initialrto", &["int", "tcp", "set", "global", "initialRto=3000"], "Initial RTO restored"),
-        ];
-
-        for (_key, args, desc) in restore_cmds {
-            let res = crate::system::process::no_window(&mut Command::new("netsh"))
-                .args(*args)
-                .output();
-            if let Ok(output) = res {
-                if output.status.success() {
-                    restored.push(desc.to_string());
-                }
-            }
-        }
-
-        if bpath.exists() {
-            let _ = fs::remove_file(&bpath);
-        }
-
-        Ok(restored)
+        &[
+            ("autotuninglevel", "normal"),
+            ("rss", "enabled"),
+            ("fastopen", "enabled"),
+            ("hystart", "enabled"),
+            ("prr", "enabled"),
+            ("timestamps", "allowed"),
+            ("rsc", "enabled"),
+            ("ecncapability", "enabled"),
+            ("initialrto", "2000"),
+        ]
     }
-
     #[cfg(target_os = "macos")]
     {
-        let mut restored = Vec::new();
-        let bpath = tcp_backup_path();
-
-        let mut backup_map = std::collections::HashMap::new();
-        if bpath.exists() {
-            if let Ok(content) = fs::read_to_string(&bpath) {
-                for line in content.lines() {
-                    if let Some((k, v)) = line.split_once('=') {
-                        backup_map.insert(k.trim().to_string(), v.trim().to_string());
-                    }
-                }
-            }
-        }
-
-        let defaults = [
-            ("net.inet.tcp.autorcvbufmax", "4194304"),
-            ("net.inet.tcp.autosndbufmax", "4194304"),
+        &[
+            ("net.inet.tcp.autorcvbufmax", "16777216"),
+            ("net.inet.tcp.autosndbufmax", "16777216"),
             ("net.inet.tcp.autorcvbuf", "1"),
             ("net.inet.tcp.autosndbuf", "1"),
-            ("net.inet.tcp.sendspace", "131072"),
-            ("net.inet.tcp.recvspace", "131072"),
-            ("kern.ipc.maxsockbuf", "8388608"),
-            ("net.inet.tcp.fastopen", "0"),
-        ];
-
-        for (key, default_val) in &defaults {
-            let val = backup_map.get(*key).map(|s| s.as_str()).unwrap_or(*default_val);
-            let arg = format!("{}={}", key, val);
-            let res = Command::new("sysctl")
-                .arg("-w")
-                .arg(&arg)
-                .output();
-            if let Ok(out) = res {
-                if out.status.success() {
-                    restored.push(format!("sysctl {} restored to {}", key, val));
+            ("net.inet.tcp.sendspace", "524288"),
+            ("net.inet.tcp.recvspace", "524288"),
+            ("kern.ipc.maxsockbuf", "16777216"),
+            ("net.inet.tcp.fastopen", "3"),
+        ]
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        &[]
+    }
+}
+fn tcp_state_path() -> PathBuf {
+    crate::net::relay::log_dir().join("tcp_snapshot.json")
+}
+fn capture_tcp() -> Result<TcpSnapshot, String> {
+    let mut original = std::collections::BTreeMap::new();
+    #[cfg(target_os = "windows")]
+    {
+        let out = crate::system::process::no_window(&mut Command::new("netsh"))
+            .args(["int", "tcp", "dump"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err("Не удалось сохранить TCP snapshot".into());
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        for token in text.split_whitespace() {
+            if let Some((key, value)) = token.split_once('=') {
+                if tcp_tunables().iter().any(|(k, _)| *k == key) {
+                    original.insert(key.to_string(), value.to_string());
                 }
             }
         }
-
-        if bpath.exists() {
-            let _ = fs::remove_file(&bpath);
+    }
+    #[cfg(target_os = "macos")]
+    for (key, _) in tcp_tunables() {
+        let out = Command::new("sysctl")
+            .args(["-n", key])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("Нет snapshot {key}"));
         }
-
-        Ok(restored)
+        original.insert(
+            key.to_string(),
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        );
     }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        Ok(vec!["Linux network stack restoration complete".to_string()])
+    if original.len() != tcp_tunables().len() || original.is_empty() {
+        return Err("Неполный TCP snapshot; настройки не изменены".into());
     }
-
-    #[cfg(not(any(target_os = "windows", unix)))]
+    Ok(TcpSnapshot {
+        platform: std::env::consts::OS.into(),
+        original,
+    })
+}
+fn validate_snapshot(snapshot: &TcpSnapshot) -> Result<(), String> {
+    if snapshot.platform != std::env::consts::OS
+        || snapshot.original.len() != tcp_tunables().len()
+        || tcp_tunables().iter().any(|(key, _)| {
+            !snapshot.original.get(*key).is_some_and(|v| {
+                !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        })
     {
-        Ok(vec!["OS network stack restoration not supported on this platform".to_string()])
+        return Err("TCP snapshot повреждён, неполон или относится к другой платформе".into());
+    }
+    Ok(())
+}
+fn write_tcp(key: &str, value: &str) -> Result<(), String> {
+    if !tcp_tunables().iter().any(|(k, _)| *k == key)
+        || value.is_empty()
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err("Некорректный TCP snapshot".into());
+    }
+    #[cfg(target_os = "windows")]
+    let result = crate::system::process::no_window(&mut Command::new("netsh"))
+        .args(["int", "tcp", "set", "global", &format!("{key}={value}")])
+        .output();
+    #[cfg(not(target_os = "windows"))]
+    let result = Command::new("sysctl")
+        .args(["-w", &format!("{key}={value}")])
+        .output();
+    let out = result.map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("Не применён TCP {key}; snapshot сохранён"))
+    }
+}
+pub fn tune_os_network_stack() -> Result<Vec<String>, String> {
+    if !crate::system::privilege::is_admin() {
+        return Err("Требуются права администратора".into());
+    }
+    if tcp_backup_path().exists() && !tcp_state_path().exists() {
+        return Err(
+            "Обнаружен старый неполный TCP backup. Сначала разберите прежний откат.".into(),
+        );
+    }
+    if !tcp_state_path().exists() {
+        let snapshot = capture_tcp()?;
+        fs::create_dir_all(crate::net::relay::log_dir()).map_err(|e| e.to_string())?;
+        crate::system::fs_utils::robust_write_file(
+            &tcp_state_path(),
+            &serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?,
+        )?;
+    }
+    let snapshot: TcpSnapshot =
+        serde_json::from_slice(&fs::read(tcp_state_path()).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    validate_snapshot(&snapshot)?;
+    let mut logs = Vec::new();
+    for (key, value) in tcp_tunables() {
+        write_tcp(key, value)?;
+        logs.push(format!("{key}={value}"));
+    }
+    let actual = capture_tcp()?;
+    if tcp_tunables()
+        .iter()
+        .any(|(key, value)| actual.original.get(*key).map(String::as_str) != Some(*value))
+    {
+        return Err("Проверка TCP после записи не пройдена; snapshot сохранён".into());
+    }
+    Ok(logs)
+}
+pub fn restore_os_network_stack() -> Result<Vec<String>, String> {
+    if !tcp_state_path().exists() {
+        return if tcp_backup_path().exists() {
+            restore_legacy_tcp()
+        } else {
+            Ok(Vec::new())
+        };
+    }
+    restore_tcp_snapshot()
+}
+
+fn restore_tcp_snapshot() -> Result<Vec<String>, String> {
+    let snapshot: TcpSnapshot =
+        serde_json::from_slice(&fs::read(tcp_state_path()).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    validate_snapshot(&snapshot)?;
+    let current = capture_tcp()?;
+    if tcp_tunables().iter().any(|(key, applied)| {
+        current.original.get(*key) != snapshot.original.get(*key)
+            && current.original.get(*key).map(String::as_str) != Some(*applied)
+    }) {
+        return Err("TCP изменён после настройки; текущие значения и backup сохранены".into());
+    }
+    for (key, value) in &snapshot.original {
+        write_tcp(key, value)?;
+    }
+    if capture_tcp()?.original != snapshot.original {
+        return Err("Проверка TCP rollback не пройдена; snapshot сохранён".into());
+    }
+    fs::remove_file(tcp_state_path()).map_err(|e| e.to_string())?;
+    Ok(vec![
+        "Исходные TCP параметры восстановлены и проверены".into()
+    ])
+}
+
+pub fn legacy_tcp_pending() -> bool {
+    tcp_backup_path().exists() && !tcp_state_path().exists()
+}
+
+/// Ordinary DNS rollback restores only settings captured by the current engine.
+/// An older incomplete backup remains available for explicit legacy recovery.
+pub fn restore_current_network_stack() -> Result<Vec<String>, String> {
+    restore_if_current(&tcp_state_path(), restore_tcp_snapshot)
+}
+fn restore_if_current(
+    path: &std::path::Path,
+    restore: impl FnOnce() -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    match fs::metadata(path) {
+        Ok(_) => restore(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e.to_string()),
     }
 }
 
-#[cfg(target_os = "windows")]
-fn capture_windows_tcp_backup() -> String {
-    let mut backup_lines = Vec::new();
-    if let Ok(output) = crate::system::process::no_window(&mut Command::new("netsh"))
-        .args(["int", "tcp", "show", "global"])
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let line_lower = line.to_lowercase();
-            if let Some((_, val)) = line.split_once(':') {
-                let v = val.trim().to_lowercase();
-                if line_lower.contains("autotuning") || line_lower.contains("автонастро") {
-                    backup_lines.push(format!("autotuninglevel={}", v));
-                } else if line_lower.contains("receive-side scaling") || line_lower.contains("масштабирования на стороне приема") {
-                    backup_lines.push(format!("rss={}", v));
-                } else if line_lower.contains("fast open") && !line_lower.contains("откат") && !line_lower.contains("fallback") {
-                    backup_lines.push(format!("fastopen={}", v));
-                } else if line_lower.contains("hystart") {
-                    backup_lines.push(format!("hystart={}", v));
-                } else if line_lower.contains("proportional rate") || line_lower.contains("коэффициента пропорции") {
-                    backup_lines.push(format!("prr={}", v));
-                } else if line_lower.contains("timestamps") || line_lower.contains("метки времени") {
-                    backup_lines.push(format!("timestamps={}", v));
-                } else if line_lower.contains("receive segment coalescing") || line_lower.contains("объединения сегментов") {
-                    backup_lines.push(format!("rsc={}", v));
-                }
-            }
+fn parse_legacy_tcp(text: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut values = std::collections::BTreeMap::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or("Некорректная строка TCP backup")?;
+        let known = tcp_tunables().iter().any(|(k, _)| *k == key)
+            || cfg!(windows)
+                && matches!(
+                    key,
+                    "heuristics" | "congestion_internet" | "congestion_custom"
+                );
+        if !known
+            || value.is_empty()
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || values.insert(key.into(), value.into()).is_some()
+        {
+            return Err(
+                "TCP backup содержит неизвестный, повторный или некорректный параметр".into(),
+            );
         }
     }
+    if values.is_empty() {
+        return Err("Старый TCP backup пуст".into());
+    }
+    Ok(values)
+}
 
-    if let Ok(output) = crate::system::process::no_window(&mut Command::new("netsh"))
+fn legacy_tcp_plan(
+    original: &std::collections::BTreeMap<String, String>,
+    current: &std::collections::BTreeMap<String, String>,
+) -> (Vec<(String, String)>, Vec<String>, usize) {
+    let mut required = tcp_tunables().to_vec();
+    if cfg!(windows) {
+        required.extend([
+            ("heuristics", "disabled"),
+            ("congestion_internet", "cubic"),
+            ("congestion_custom", "cubic"),
+        ]);
+    }
+    let mut writes = vec![];
+    let mut unresolved = vec![];
+    let mut verified = 0;
+    for (key, applied) in required {
+        match (original.get(key), current.get(key)) {
+            (None, _) => unresolved.push(format!("{key}: исходное значение отсутствует")),
+            (Some(_), None) => unresolved.push(format!("{key}: текущее значение не прочитано")),
+            (Some(before), Some(now)) if before == now => verified += 1,
+            (Some(before), Some(now)) if now == applied => {
+                writes.push((key.into(), before.clone()))
+            }
+            _ => unresolved.push(format!("{key}: изменён после настройки, сохранён")),
+        }
+    }
+    (writes, unresolved, verified)
+}
+
+#[cfg(windows)]
+fn read_legacy_heuristics() -> Option<String> {
+    let output = crate::system::process::no_window(&mut Command::new("netsh"))
         .args(["int", "tcp", "show", "heuristics"])
         .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let line_lower = line.to_lowercase();
-            if (line_lower.contains("heuristic") || line_lower.contains("эвристик")) && line.contains(':') {
-                if let Some((_, val)) = line.split_once(':') {
-                    let v = val.trim().to_lowercase();
-                    backup_lines.push(format!("heuristics={}", v));
-                    break;
-                }
-            }
-        }
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-
-    backup_lines.join("\n")
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = text.lines().find_map(|l| {
+        l.split_once(':')
+            .map(|(_, v)| v.trim().to_ascii_lowercase())
+    })?;
+    if matches!(value.as_str(), "enabled" | "disabled") {
+        Some(value)
+    } else {
+        None
+    }
 }
 
-#[cfg(target_os = "macos")]
-fn capture_macos_sysctl_backup() -> String {
-    let mut backup_lines = Vec::new();
-    let sysctl_keys = [
-        "net.inet.tcp.autorcvbufmax",
-        "net.inet.tcp.autosndbufmax",
-        "net.inet.tcp.autorcvbuf",
-        "net.inet.tcp.autosndbuf",
-        "net.inet.tcp.sendspace",
-        "net.inet.tcp.recvspace",
-        "kern.ipc.maxsockbuf",
-        "net.inet.tcp.fastopen",
-    ];
-
-    for key in &sysctl_keys {
-        if let Ok(output) = Command::new("sysctl").arg("-n").arg(key).output() {
-            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !val.is_empty() {
-                backup_lines.push(format!("{}={}", key, val));
+fn restore_legacy_tcp() -> Result<Vec<String>, String> {
+    let original =
+        parse_legacy_tcp(&fs::read_to_string(tcp_backup_path()).map_err(|e| e.to_string())?)?;
+    let mut current = capture_tcp()?.original;
+    #[cfg(windows)]
+    if let Some(value) = read_legacy_heuristics() {
+        current.insert("heuristics".into(), value);
+    }
+    let (writes, mut unresolved, verified) = legacy_tcp_plan(&original, &current);
+    for (key, value) in &writes {
+        #[cfg(windows)]
+        if key == "heuristics" {
+            if !matches!(value.as_str(), "enabled" | "disabled") {
+                unresolved.push("heuristics: неподдерживаемое исходное значение".into());
+                continue;
             }
+            let output = crate::system::process::no_window(&mut Command::new("netsh"))
+                .args(["int", "tcp", "set", "heuristics", value])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                unresolved.push("heuristics: запись не выполнена".into());
+            }
+            continue;
+        }
+        if let Err(e) = write_tcp(key, value) {
+            unresolved.push(e);
         }
     }
-
-    backup_lines.join("\n")
+    let mut after = capture_tcp()?.original;
+    #[cfg(windows)]
+    if let Some(value) = read_legacy_heuristics() {
+        after.insert("heuristics".into(), value);
+    }
+    let mut restored = verified;
+    for (key, value) in &writes {
+        if after.get(key) == Some(value) {
+            restored += 1;
+        } else {
+            unresolved.push(format!("{key}: восстановление не подтверждено"));
+        }
+    }
+    if unresolved.is_empty() {
+        // Keep the old backup as an archive, but do not retry a completed restore.
+        let bytes = fs::read(tcp_backup_path()).map_err(|e| e.to_string())?;
+        crate::system::journal::archive_legacy(&tcp_backup_path(), &bytes)?;
+        fs::remove_file(tcp_backup_path()).map_err(|e| e.to_string())?;
+        Ok(vec![format!(
+            "Старый TCP backup: восстановлено и проверено {restored} параметров"
+        )])
+    } else {
+        Err(format!("Старый TCP backup: восстановлено/уже совпадает {restored} параметров. Осталось: {}. Backup сохранён: {}. Для отсутствующих значений нужен прежний системный профиль; сброс к стандартным значениям — отдельная операция, не точный откат.", unresolved.join("; "), tcp_backup_path().display()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -767,7 +868,63 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::time::Duration;
+    #[test]
+    fn dns_rollback_ignores_unrelated_legacy_backup_but_preserves_current_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("tcp_backup.conf"), "rss=enabled").unwrap();
+        let current = dir.path().join("tcp_snapshot.json");
+        assert!(
+            restore_if_current(&current, || panic!("legacy restore must not run"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(dir.path().join("tcp_backup.conf").exists());
+        fs::write(&current, "broken").unwrap();
+        assert_eq!(
+            restore_if_current(&current, || Err("damaged current backup".into())).unwrap_err(),
+            "damaged current backup"
+        );
+    }
+    #[test]
+    fn legacy_tcp_restores_only_recorded_values_and_preserves_later_edits() {
+        let first = tcp_tunables()[0];
+        let second = tcp_tunables()[1];
+        let original =
+            parse_legacy_tcp(&format!("{}=disabled\n{}=disabled", first.0, second.0)).unwrap();
+        let current = [
+            (first.0.to_string(), first.1.to_string()),
+            (second.0.to_string(), "userchanged".into()),
+        ]
+        .into_iter()
+        .collect();
+        let (writes, unresolved, _) = legacy_tcp_plan(&original, &current);
+        assert_eq!(writes, vec![(first.0.into(), "disabled".into())]);
+        assert!(unresolved
+            .iter()
+            .any(|s| s.contains(second.0) && s.contains("изменён")));
+        assert!(unresolved.iter().any(|s| s.contains("отсутствует")));
+        assert!(parse_legacy_tcp("rss=enabled\nrss=disabled").is_err());
+        assert!(parse_legacy_tcp("rss=enabled & injected").is_err());
+    }
 
+    #[test]
+    fn tcp_snapshot_must_contain_every_original_setting_before_writing() {
+        let mut snapshot = TcpSnapshot {
+            platform: std::env::consts::OS.into(),
+            original: tcp_tunables()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        assert!(validate_snapshot(&snapshot).is_ok());
+        snapshot
+            .original
+            .insert("unexpected".into(), "enabled".into());
+        assert!(validate_snapshot(&snapshot).is_err());
+        snapshot.original.remove("unexpected");
+        snapshot.original.pop_first();
+        assert!(validate_snapshot(&snapshot).is_err());
+    }
     #[test]
     fn test_configure_tcp_stream_basic() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind test listener");
@@ -784,17 +941,27 @@ mod tests {
         configure_tcp_stream(&client).expect("Configure client stream failed");
 
         // Verify TCP_NODELAY is enabled on client
-        assert!(client.nodelay().unwrap_or(false), "TCP_NODELAY must be true on configured client");
+        assert!(
+            client.nodelay().unwrap_or(false),
+            "TCP_NODELAY must be true on configured client"
+        );
 
         let incoming = handle.join().expect("Thread join failed");
-        assert!(incoming.nodelay().unwrap_or(false), "TCP_NODELAY must be true on configured server stream");
+        assert!(
+            incoming.nodelay().unwrap_or(false),
+            "TCP_NODELAY must be true on configured server stream"
+        );
     }
 
     #[test]
     fn test_configure_tcp_listener_basic() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind listener");
         let result = configure_tcp_listener(&listener);
-        assert!(result.is_ok(), "configure_tcp_listener must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "configure_tcp_listener must succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -809,22 +976,42 @@ mod tests {
         {
             use std::os::windows::io::AsRawSocket;
             let raw = client.as_raw_socket();
-            let rcvbuf = win_sock::get_socket_buffer_size(raw, win_sock::SO_RCVBUF).expect("getsockopt SO_RCVBUF failed");
-            assert!(rcvbuf >= 65536, "SO_RCVBUF expected >= 64KB, got {}", rcvbuf);
+            let rcvbuf = win_sock::get_socket_buffer_size(raw, win_sock::SO_RCVBUF)
+                .expect("getsockopt SO_RCVBUF failed");
+            assert!(
+                rcvbuf >= 65536,
+                "SO_RCVBUF expected >= 64KB, got {}",
+                rcvbuf
+            );
 
-            let sndbuf = win_sock::get_socket_buffer_size(raw, win_sock::SO_SNDBUF).expect("getsockopt SO_SNDBUF failed");
-            assert!(sndbuf >= 65536, "SO_SNDBUF expected >= 64KB, got {}", sndbuf);
+            let sndbuf = win_sock::get_socket_buffer_size(raw, win_sock::SO_SNDBUF)
+                .expect("getsockopt SO_SNDBUF failed");
+            assert!(
+                sndbuf >= 65536,
+                "SO_SNDBUF expected >= 64KB, got {}",
+                sndbuf
+            );
         }
 
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
             let fd = client.as_raw_fd();
-            let rcvbuf = unix_sock::get_socket_buffer_size(fd, libc::SO_RCVBUF).expect("getsockopt SO_RCVBUF failed");
-            assert!(rcvbuf >= 65536, "SO_RCVBUF expected >= 64KB, got {}", rcvbuf);
+            let rcvbuf = unix_sock::get_socket_buffer_size(fd, libc::SO_RCVBUF)
+                .expect("getsockopt SO_RCVBUF failed");
+            assert!(
+                rcvbuf >= 65536,
+                "SO_RCVBUF expected >= 64KB, got {}",
+                rcvbuf
+            );
 
-            let sndbuf = unix_sock::get_socket_buffer_size(fd, libc::SO_SNDBUF).expect("getsockopt SO_SNDBUF failed");
-            assert!(sndbuf >= 65536, "SO_SNDBUF expected >= 64KB, got {}", sndbuf);
+            let sndbuf = unix_sock::get_socket_buffer_size(fd, libc::SO_SNDBUF)
+                .expect("getsockopt SO_SNDBUF failed");
+            assert!(
+                sndbuf >= 65536,
+                "SO_SNDBUF expected >= 64KB, got {}",
+                sndbuf
+            );
         }
     }
 
@@ -834,7 +1021,9 @@ mod tests {
         let addr = listener.local_addr().expect("Addr failed");
 
         let mut client = TcpStream::connect(addr).expect("Connect failed");
-        client.set_nonblocking(true).expect("Set nonblocking failed");
+        client
+            .set_nonblocking(true)
+            .expect("Set nonblocking failed");
 
         // configure_tcp_stream should not reset or break non-blocking state
         configure_tcp_stream(&client).expect("Configure on nonblocking stream failed");
@@ -845,7 +1034,10 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // Expected behavior for non-blocking stream
             }
-            other => panic!("Expected WouldBlock on empty non-blocking read, got {:?}", other),
+            other => panic!(
+                "Expected WouldBlock on empty non-blocking read, got {:?}",
+                other
+            ),
         }
     }
 
@@ -853,13 +1045,20 @@ mod tests {
     fn test_udp_socket_buffers() {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("Udp bind failed");
         let result = set_socket_buffers(&socket, 512 * 1024);
-        assert!(result.is_ok(), "set_socket_buffers on UDP socket failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "set_socket_buffers on UDP socket failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_os_network_status_query() {
         let status = get_os_network_status();
-        assert!(!status.is_empty(), "get_os_network_status must return a descriptive string");
+        assert!(
+            !status.is_empty(),
+            "get_os_network_status must return a descriptive string"
+        );
     }
 
     #[test]

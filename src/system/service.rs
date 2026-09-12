@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
+use crate::system::process::no_window;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use crate::system::process::no_window;
 
 pub const FORWARDER_FLAG: &str = "--dns-forwarder";
 pub const TASK_NAME: &str = "AntigravityBypassRussia";
@@ -38,12 +38,81 @@ pub fn installed_exe() -> PathBuf {
     install_dir().join(EXE_NAME)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn classify_launchd_query(success: bool, code: Option<i32>, stderr: &str) -> Result<bool, String> {
+    if success {
+        return Ok(true);
+    }
+    if code == Some(113) || stderr.contains("Could not find service") {
+        return Ok(false);
+    }
+    Err(format!(
+        "Проверка launchd (код {code:?}): {}",
+        stderr.trim()
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_job_loaded() -> Result<bool, String> {
+    let output = Command::new("/bin/launchctl")
+        .args(["print", &format!("system/{LAUNCHD_LABEL}")])
+        .output()
+        .map_err(|e| format!("launchctl print: {e}"))?;
+    classify_launchd_query(
+        output.status.success(),
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn unload_mac_job() -> Result<(), String> {
+    if !mac_job_loaded()? {
+        return Ok(());
+    }
+    let output = Command::new("/bin/launchctl")
+        .args(["bootout", &format!("system/{LAUNCHD_LABEL}")])
+        .output()
+        .map_err(|e| format!("launchctl bootout: {e}"))?;
+    if !output.status.success() && mac_job_loaded()? {
+        return Err(format!(
+            "Не выгрузить DNS-службу: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if mac_job_loaded()? {
+        return Err("DNS-служба ещё зарегистрирована в launchd; повторите отключение".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod launchd_tests {
+    #[test]
+    fn absent_job_is_idempotent_but_query_failure_blocks_cleanup() {
+        assert_eq!(
+            super::classify_launchd_query(false, Some(113), "Could not find service").unwrap(),
+            false
+        );
+        assert_eq!(
+            super::classify_launchd_query(true, Some(0), "").unwrap(),
+            true
+        );
+        assert!(super::classify_launchd_query(false, Some(1), "Operation not permitted").is_err());
+        assert!(super::classify_launchd_query(false, None, "").is_err());
+    }
+}
+
 fn same_file_bytes(a: &Path, b: &Path) -> bool {
-    let (Ok(meta_a), Ok(meta_b)) = (fs::metadata(a), fs::metadata(b)) else { return false };
+    let (Ok(meta_a), Ok(meta_b)) = (fs::metadata(a), fs::metadata(b)) else {
+        return false;
+    };
     if meta_a.len() != meta_b.len() {
         return false;
     }
-    let (Ok(mut fa), Ok(mut fb)) = (File::open(a), File::open(b)) else { return false };
+    let (Ok(mut fa), Ok(mut fb)) = (File::open(a), File::open(b)) else {
+        return false;
+    };
     let mut buf_a = [0u8; 64 * 1024];
     let mut buf_b = [0u8; 64 * 1024];
     loop {
@@ -68,7 +137,7 @@ pub fn is_enabled() -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        PathBuf::from(LAUNCHD_PLIST).exists()
+        PathBuf::from(LAUNCHD_PLIST).exists() || mac_job_loaded().unwrap_or(true)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     false
@@ -102,8 +171,13 @@ pub fn is_running() -> bool {
 
 pub fn enable() -> Result<(), String> {
     let dir = install_dir();
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("Не удалось создать директорию службы {}: {}", dir.display(), e))?;
+    fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "Не удалось создать директорию службы {}: {}",
+            dir.display(),
+            e
+        )
+    })?;
 
     let src = std::env::current_exe()
         .map_err(|e| format!("Не удалось определить путь к текущему exe: {}", e))?;
@@ -121,8 +195,7 @@ pub fn enable() -> Result<(), String> {
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = Command::new("launchctl").args(["bootout", &format!("system/{}", LAUNCHD_LABEL)]).output();
-            let _ = Command::new("launchctl").args(["unload", "-w", LAUNCHD_PLIST]).output();
+            unload_mac_job()?;
         }
 
         crate::system::process::stop_process_by_name(EXE_NAME);
@@ -138,8 +211,12 @@ pub fn enable() -> Result<(), String> {
             if attempt % 5 == 0 {
                 #[cfg(target_os = "windows")]
                 {
-                    let _ = no_window(&mut Command::new("schtasks")).args(["/End", "/TN", TASK_NAME]).output();
-                    let _ = no_window(&mut Command::new("taskkill")).args(["/F", "/T", "/IM", EXE_NAME]).output();
+                    let _ = no_window(&mut Command::new("schtasks"))
+                        .args(["/End", "/TN", TASK_NAME])
+                        .output();
+                    let _ = no_window(&mut Command::new("taskkill"))
+                        .args(["/F", "/T", "/IM", EXE_NAME])
+                        .output();
                 }
                 crate::system::process::stop_process_by_name(EXE_NAME);
             }
@@ -153,7 +230,13 @@ pub fn enable() -> Result<(), String> {
                 e
             )
         })?;
-        crate::system::fs_utils::post_write_hook(&dst);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dst, fs::Permissions::from_mode(0o755))
+                .map_err(|e| e.to_string())?;
+        }
+        crate::system::fs_utils::post_write_hook(&dst)?;
     }
 
     #[cfg(target_os = "windows")]
@@ -213,12 +296,13 @@ pub fn enable() -> Result<(), String> {
         );
 
         let xml_path = dir.join("task.xml");
-        let mut file = File::create(&xml_path)
-            .map_err(|e| format!("Не удалось создать XML задачи: {}", e))?;
+        let mut file =
+            File::create(&xml_path).map_err(|e| format!("Не удалось создать XML задачи: {}", e))?;
         use std::io::Write;
         file.write_all(&[0xFF, 0xFE]).map_err(|e| e.to_string())?;
         for unit in task_xml.encode_utf16() {
-            file.write_all(&unit.to_le_bytes()).map_err(|e| e.to_string())?;
+            file.write_all(&unit.to_le_bytes())
+                .map_err(|e| e.to_string())?;
         }
         drop(file);
 
@@ -244,13 +328,23 @@ pub fn enable() -> Result<(), String> {
             return Err(format!("schtasks /Create завершился ошибкой: {}", err));
         }
 
-        let _ = no_window(&mut Command::new("schtasks"))
+        let started = no_window(&mut Command::new("schtasks"))
             .args(["/Run", "/TN", TASK_NAME])
-            .output();
+            .output()
+            .map_err(|e| format!("Запуск DNS-службы: {e}"))?;
+        if !started.status.success() {
+            return Err(format!(
+                "Не запустить DNS-службу ({}): {} {}",
+                started.status,
+                String::from_utf8_lossy(&started.stderr).trim(),
+                String::from_utf8_lossy(&started.stdout).trim()
+            ));
+        }
     }
 
     #[cfg(target_os = "macos")]
     {
+        unload_mac_job()?;
         let plist_path = LAUNCHD_PLIST;
         let stderr_log = dir.join("stderr.log");
         let stdout_log = dir.join("stdout.log");
@@ -296,21 +390,31 @@ pub fn enable() -> Result<(), String> {
             stdout_log.display()
         );
 
-        fs::write(plist_path, plist_content)
+        crate::system::fs_utils::robust_write_file(Path::new(plist_path), plist_content.as_bytes())
             .map_err(|e| format!("Не удалось записать plist демона: {}", e))?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(plist_path, fs::Permissions::from_mode(0o644));
+            fs::set_permissions(plist_path, fs::Permissions::from_mode(0o644))
+                .map_err(|e| e.to_string())?;
+            use std::os::fd::AsRawFd;
+            let file = File::open(plist_path).map_err(|e| e.to_string())?;
+            if unsafe { libc::fchown(file.as_raw_fd(), 0, 0) } != 0 {
+                return Err(format!(
+                    "Владелец plist: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
         }
 
-        let _ = Command::new("launchctl").args(["bootout", &format!("system/{}", LAUNCHD_LABEL)]).output();
-        let _ = Command::new("launchctl").args(["unload", plist_path]).output();
-
-        let out = Command::new("launchctl").args(["bootstrap", "system", plist_path]).output();
+        let out = Command::new("launchctl")
+            .args(["bootstrap", "system", plist_path])
+            .output();
         if out.map(|o| !o.status.success()).unwrap_or(true) {
-            let fallback = Command::new("launchctl").args(["load", "-w", plist_path]).output()
+            let fallback = Command::new("launchctl")
+                .args(["load", "-w", plist_path])
+                .output()
                 .map_err(|e| format!("launchctl load failed: {}", e))?;
             if !fallback.status.success() {
                 return Err("Не удалось загрузить LaunchDaemon через launchctl".to_string());
@@ -369,25 +473,30 @@ pub fn disable() -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
+        unload_mac_job()?;
         if Path::new(LAUNCHD_PLIST).exists() {
-            let _ = Command::new("launchctl").args(["bootout", &format!("system/{}", LAUNCHD_LABEL)]).output();
-            let _ = Command::new("launchctl").args(["unload", "-w", LAUNCHD_PLIST]).output();
-            let _ = fs::remove_file(LAUNCHD_PLIST);
+            fs::remove_file(LAUNCHD_PLIST).map_err(|e| format!("Удаление plist: {e}"))?;
         }
     }
 
     crate::system::process::stop_process_by_name(EXE_NAME);
 
-    let dir = install_dir();
-    let current_exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
-    if dir.exists() && Some(&dir) != current_exe_dir.as_ref() {
-        for _ in 0..10 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let _ = fs::remove_file(installed_exe());
-            if fs::remove_dir_all(&dir).is_ok() || !dir.exists() {
-                break;
-            }
+    for _ in 0..20 {
+        if !is_running() {
+            break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if is_running() || is_enabled() {
+        return Err(
+            "Служба ещё активна; восстановление сетевых файлов отменено до её остановки".into(),
+        );
+    }
+
+    // Keep state/backups until their owners have verified restoration. Never delete this tree.
+    let installed = installed_exe();
+    if std::env::current_exe().ok().as_ref() != Some(&installed) && installed.exists() {
+        fs::remove_file(&installed).map_err(|e| format!("Не удалить бинарник службы: {e}"))?;
     }
     Ok(())
 }

@@ -1,31 +1,37 @@
 pub mod client;
+pub mod config;
+pub mod dns_https;
 pub mod doh;
 pub mod egress;
 pub mod health;
 pub mod hosts;
+pub mod log_monitor;
 pub mod nrpt;
 pub mod provider;
-pub mod proxy;
 pub mod rank;
 pub mod relay;
 pub mod resolvers;
+pub mod route_health;
 pub mod routes;
 pub mod socket;
+#[cfg(any(target_os = "macos", test))]
+pub mod split_dns;
 
 pub use relay::{detach_console, log_fatal, run as run_dns_relay};
 
+use crate::system::process::no_window;
+use provider::{nrpt_domains, NRPT_AGENT, NRPT_STUDIO, NRPT_TAG, SUBSTITUTION_CANARIES};
+use relay::{LISTEN_IP, LISTEN_PORT};
+use routes::{add_static_routes, remove_static_routes};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-use crate::system::process::no_window;
-use provider::{nrpt_domains, GEOHIDE_PROXY_V4, NRPT_AGENT, NRPT_STUDIO, SUBSTITUTION_CANARIES, NRPT_TAG};
-use relay::{LISTEN_IP, LISTEN_PORT};
-use routes::{add_static_routes, remove_static_routes, restore_ipv4_preference, set_ipv4_preference};
 
 fn assemble_nameservers(via_relay: bool, substituters: &[&str]) -> String {
     let mut servers: Vec<String> = Vec::new();
     if via_relay {
-        servers.push(LISTEN_IP.to_string());
+        // External NRPT nameservers would bypass DoH, route quarantine and TLS checks.
+        return LISTEN_IP.to_string();
     }
     if substituters.is_empty() {
         for s in resolvers::fallback_v4() {
@@ -39,26 +45,58 @@ fn assemble_nameservers(via_relay: bool, substituters: &[&str]) -> String {
     servers.join(";")
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn active_relay_cannot_be_bypassed_by_external_nrpt_fallbacks() {
+        assert_eq!(
+            super::assemble_nameservers(true, &["1.2.3.4"]),
+            super::LISTEN_IP
+        );
+        assert_eq!(super::assemble_nameservers(false, &["1.2.3.4"]), "1.2.3.4");
+        assert_eq!(
+            super::assemble_nameservers(false, &[]).split(';').count(),
+            7
+        );
+    }
+}
+
+pub fn preflight() -> Result<(), String> {
+    egress::ensure_tun_disabled()?;
+    #[cfg(target_os = "macos")]
+    split_dns::preflight(std::path::Path::new("/etc/resolver"), &nrpt_domains())?;
+    Ok(())
+}
+
 pub fn apply_dns_rules() -> Result<String, String> {
     fn step(msg: &str) {
         println!("  \x1b[90m… {}\x1b[0m", msg);
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
-    step("очистка старых DNS-правил");
-    remove_dns_rules();
+    preflight()?;
+    config::prepare_service()?;
+    step("Подготавливаем подключение");
+    remove_dns_configuration(false)?;
 
     let names = nrpt_domains();
-    step("перехват чужих NRPT / отключение Auto-DoH");
-    let _ = nrpt::take_over_conflicting_rules(&names);
-    crate::net::doh::disable_system_doh();
+    step("Проверяем настройки сети");
+    let conflicts = nrpt::conflicting_rules(&names)?;
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "Конфликт NRPT: {}. Чужие правила сохранены.",
+            conflicts.join(", ")
+        ));
+    }
+    crate::net::doh::disable_system_doh()?;
 
-    step("оптимизация TCP-стека (TCP Auto-Tuning normal, 512KB buffers)");
-    let _ = crate::net::socket::tune_os_network_stack();
-
-    step("поиск физического адаптера (не VPN)");
+    step("Определяем подключение к интернету");
     let egress = crate::net::egress::detect();
     let if_index = egress.as_ref().map(|e| e.if_index).unwrap_or(0);
+    #[cfg(windows)]
+    if if_index == 0 || egress.as_ref().is_none_or(|e| e.gateway.is_none()) {
+        return Err("Не найден физический выход в интернет; проверка через VPN отменена".into());
+    }
     if if_index > 0 {
         crate::net::relay::save_if_index(if_index);
     }
@@ -74,63 +112,64 @@ pub fn apply_dns_rules() -> Result<String, String> {
     // leak into the tunnel and SmartDNS returns genuine Google.
     #[cfg(target_os = "windows")]
     {
-        step("маршруты SmartDNS через физический адаптер");
-        set_ipv4_preference();
-        add_static_routes();
+        step("Подготавливаем DNS");
+        add_static_routes()?;
         thread::sleep(Duration::from_millis(400));
     }
 
     let mut sub_notes = Vec::new();
     let mut pending: Vec<(String, Vec<&'static str>)> = Vec::new();
-    step("проверка подмены по каждому хосту");
-    for name in NRPT_AGENT {
-        let host = name.trim_start_matches('.');
-        let subs = resolvers::substituting_addrs(host, if_index);
-        if subs.is_empty() {
-            sub_notes.push(format!("{host}: нет"));
-            pending.push(((*name).to_string(), GEOHIDE_PROXY_V4.to_vec()));
-        } else {
-            sub_notes.push(format!("{host}: {}", subs.join(", ")));
-            pending.push(((*name).to_string(), subs));
+    step("Проверяем доступные серверы");
+    {
+        for name in NRPT_AGENT {
+            let host = name.trim_start_matches('.');
+            let subs = resolvers::substituting_addrs(host, if_index);
+            if subs.is_empty() {
+                sub_notes.push(format!("{host}: нет"));
+                pending.push(((*name).to_string(), resolvers::fallback_v4()));
+            } else {
+                sub_notes.push(format!("{host}: {}", subs.join(", ")));
+                pending.push(((*name).to_string(), subs));
+            }
         }
-    }
-    let mut studio_subs: Vec<&'static str> = Vec::new();
-    for name in SUBSTITUTION_CANARIES {
-        let host = name.trim_start_matches('.');
-        for s in resolvers::substituting_addrs(host, if_index) {
-            if !studio_subs.contains(&s) {
-                studio_subs.push(s);
+        let mut studio_subs: Vec<&'static str> = Vec::new();
+        for name in SUBSTITUTION_CANARIES {
+            let host = name.trim_start_matches('.');
+            for s in resolvers::substituting_addrs(host, if_index) {
+                if !studio_subs.contains(&s) {
+                    studio_subs.push(s);
+                }
+            }
+        }
+        if studio_subs.is_empty() {
+            sub_notes
+                .push("Studio/Gemini: подмена не подтверждена, оставлены все резервные DNS".into());
+            for name in NRPT_STUDIO {
+                pending.push(((*name).to_string(), resolvers::fallback_v4()));
+            }
+        } else {
+            sub_notes.push(format!("Studio/Gemini: {}", studio_subs.join(", ")));
+            for name in NRPT_STUDIO {
+                pending.push(((*name).to_string(), studio_subs.clone()));
             }
         }
     }
-    if studio_subs.is_empty() {
-        sub_notes.push("Studio/Gemini: SmartDNS пропущен, используем Geohide SNI прокси".into());
-        for name in NRPT_STUDIO {
-            pending.push(((*name).to_string(), GEOHIDE_PROXY_V4.to_vec()));
-        }
-    } else {
-        sub_notes.push(format!("Studio/Gemini: {}", studio_subs.join(", ")));
-        for name in NRPT_STUDIO {
-            pending.push(((*name).to_string(), studio_subs.clone()));
-        }
+    step("Выбираем подходящее подключение");
+    let ranked = crate::net::rank::rescan_agent(if_index)?;
+    for note in crate::net::rank::format_notes(&ranked) {
+        sub_notes.push(note);
     }
 
     let mut relay_ok = false;
     let mut relay_note = String::new();
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        step("запуск локального релея 127.0.0.53:53");
+        step("Запускаем DNS-обход");
         match crate::system::service::enable() {
             Ok(()) => {
-                for _ in 0..40 {
-                    if crate::system::service::is_running() {
-                        relay_ok = true;
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
+                relay_ok = wait_for_ready(Duration::from_secs(4), relay_ready);
                 if !relay_ok {
-                    relay_note = "релей не поднялся за 4с, NRPT напрямую на SmartDNS".into();
+                    relay_note = "фоновый процесс не подтвердил готовность за 4с".into();
                 }
             }
             Err(e) => {
@@ -138,50 +177,43 @@ pub fn apply_dns_rules() -> Result<String, String> {
             }
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        // No resident daemon: /etc/resolver talks to SmartDNS directly.
-        // Lid close / sleep then costs nothing (no wake, no polling).
-        step("DNS через /etc/resolver (без фонового процесса)");
-        let _ = crate::system::service::disable();
+    // Readiness is local; separately verify that the DNS data path answers.
+    if relay_ok && !relay_answers() {
+        relay_ok = false;
+        relay_note =
+            "процесс запущен, но DNS-проверка не прошла; сохранены резервные адреса".into();
     }
-
     let mut rules: Vec<(String, String)> = Vec::new();
+    if relay_ok {
+        // Static hosts must not hide the adaptive relay from the client.
+        hosts::remove_entries()?;
+    }
     for (name, subs) in &pending {
-        rules.push((name.clone(), assemble_nameservers(relay_ok, subs)));
+        if !rules.iter().any(|(n, _)| n == name) {
+            rules.push((name.clone(), assemble_nameservers(relay_ok, subs)));
+        }
     }
 
     #[cfg(target_os = "windows")]
     {
-        step("запись NRPT");
-        crate::net::nrpt::apply_nrpt_rules_direct(&rules, NRPT_TAG, "Antigravity DNS");
-        let _ = no_window(&mut Command::new("ipconfig")).arg("/flushdns").output();
+        step("Сохраняем настройки подключения");
+        let count = crate::net::nrpt::apply_nrpt_rules_direct(&rules, NRPT_TAG, "Antigravity DNS");
+        if count != rules.len() {
+            return Err(format!("NRPT: записано {count}/{} правил", rules.len()));
+        }
+        crate::net::nrpt::verify_effective(&rules)?;
+        let _ = no_window(&mut Command::new("ipconfig"))
+            .arg("/flushdns")
+            .output();
     }
 
     #[cfg(target_os = "macos")]
     {
-        let res_dir = std::path::Path::new("/etc/resolver");
-        if !res_dir.exists() {
-            let _ = std::fs::create_dir_all(res_dir);
-        }
-        for (domain, csv) in &rules {
-            let clean_domain = domain.trim_start_matches('.');
-            let file_path = res_dir.join(clean_domain);
-            let mut content = format!("# ANTIGRAVITY-BYPASS-RUSSIA\n# {}\n", clean_domain);
-            for ip in csv.split(';').filter(|s| !s.is_empty()) {
-                content.push_str(&format!("nameserver {}\n", ip));
-            }
-            content.push_str("port 53\nsearch_order 1\ntimeout 2\n");
-            let _ = std::fs::write(&file_path, content);
-        }
+        split_dns::apply(std::path::Path::new("/etc/resolver"), &rules)?;
         let _ = Command::new("dscacheutil").arg("-flushcache").output();
-        let _ = Command::new("killall").args(["-HUP", "mDNSResponder"]).output();
-    }
-
-    step("ранжирование прокси Cloud Code (быстрый первый, остальные запас)");
-    let ranked = crate::net::rank::rescan_agent(if_index);
-    for note in crate::net::rank::format_notes(&ranked) {
-        sub_notes.push(note);
+        let _ = Command::new("killall")
+            .args(["-HUP", "mDNSResponder"])
+            .output();
     }
 
     let mut msg = if relay_ok {
@@ -200,39 +232,127 @@ pub fn apply_dns_rules() -> Result<String, String> {
     Ok(msg)
 }
 
-pub fn remove_dns_rules() {
-    let _ = crate::system::service::disable();
-    crate::net::egress::remove_legacy_routes();
-    let _ = crate::net::hosts::remove_entries();
-    crate::net::doh::restore_system_doh();
-    let _ = crate::net::socket::restore_os_network_stack();
+fn relay_answers() -> bool {
+    let query = client::build_query("daily-cloudcode-pa.googleapis.com", 0xA651);
+    client::query_raw_via(
+        &query,
+        LISTEN_IP.parse().unwrap(),
+        0,
+        Duration::from_secs(3),
+    )
+    .is_ok_and(|reply| client::is_successful_response(&reply))
+}
 
+fn relay_ready(timeout: Duration) -> bool {
+    let query = client::build_query(relay::HEALTH_NAME, 0xA652);
+    client::query_raw_to(
+        &query,
+        std::net::SocketAddrV4::new(LISTEN_IP.parse().unwrap(), relay::HEALTH_PORT),
+        0,
+        timeout,
+    )
+    .is_ok_and(|reply| {
+        client::answer_addrs(&reply) == vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]
+    })
+}
+
+fn wait_for_ready(budget: Duration, mut probe: impl FnMut(Duration) -> bool) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        if left.is_zero() {
+            break;
+        }
+        if probe(left.min(Duration::from_millis(250))) {
+            return true;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(100)),
+        );
+    }
+    false
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn slow_probe_cannot_multiply_the_startup_budget() {
+        let start = std::time::Instant::now();
+        let mut calls = 0;
+        assert!(!wait_for_ready(Duration::from_millis(40), |left| {
+            calls += 1;
+            thread::sleep(left);
+            false
+        }));
+        assert_eq!(calls, 1);
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+    #[test]
+    fn ready_probe_finishes_without_waiting_out_the_budget() {
+        let start = std::time::Instant::now();
+        assert!(wait_for_ready(Duration::from_secs(4), |_| true));
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+}
+
+pub fn remove_dns_rules() -> Result<(), String> {
+    remove_dns_configuration(true)
+}
+
+fn remove_dns_configuration(restore_tcp: bool) -> Result<(), String> {
+    let mut errors = Vec::new();
+    // Stop the background writer, but retain its directory and every backup.
+    crate::system::service::disable()?;
+    // Remove only the obsolete marker from the experimental TUN mode.
+    let legacy_mode = relay::log_dir().join("hosts-mode");
+    match std::fs::remove_file(legacy_mode) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    if let Err(e) = crate::net::hosts::remove_entries() {
+        errors.push(e);
+    }
+    if let Err(e) = crate::net::doh::restore_system_doh() {
+        errors.push(e);
+    }
+    if restore_tcp {
+        if let Err(e) = crate::net::socket::restore_current_network_stack() {
+            errors.push(e);
+        }
+    }
     #[cfg(target_os = "windows")]
     {
-        restore_ipv4_preference();
-        remove_static_routes();
-        crate::net::nrpt::native_remove_nrpt_rules();
-        let _ = no_window(&mut Command::new("ipconfig")).arg("/flushdns").output();
+        if let Err(e) = remove_static_routes() {
+            errors.push(e);
+        }
+        if let Err(e) = crate::net::nrpt::native_remove_nrpt_rules() {
+            errors.push(e);
+        }
+        if crate::net::nrpt::get_nrpt_status_info().0 != 0 {
+            errors.push("Не все правила NRPT удалены".into());
+        }
+        let _ = no_window(&mut Command::new("ipconfig"))
+            .arg("/flushdns")
+            .output();
     }
-
     #[cfg(target_os = "macos")]
     {
-        let res_dir = std::path::Path::new("/etc/resolver");
-        if res_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(res_dir) {
-                for entry in entries.flatten() {
-                    let file_path = entry.path();
-                    if file_path.is_file() {
-                        if let Ok(c) = std::fs::read_to_string(&file_path) {
-                            if c.contains("# ANTIGRAVITY-BYPASS-RUSSIA") {
-                                let _ = std::fs::remove_file(file_path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        errors.extend(split_dns::remove(
+            std::path::Path::new("/etc/resolver"),
+            &nrpt_domains(),
+        ));
         let _ = Command::new("dscacheutil").arg("-flushcache").output();
-        let _ = Command::new("killall").args(["-HUP", "mDNSResponder"]).output();
+        let _ = Command::new("killall")
+            .args(["-HUP", "mDNSResponder"])
+            .output();
+    }
+    resolvers::invalidate_network_caches();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }

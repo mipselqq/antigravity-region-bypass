@@ -1,83 +1,90 @@
 use crate::core::detector::get_quick_status;
 use crate::core::patcher::BinaryState;
-use crate::net::nrpt::get_nrpt_status_info;
-use crate::system::privilege::is_admin;
 
 pub fn banner() {
-    println!("\x1b[96m=====================================================\x1b[0m");
     println!(
-        "\x1b[96m          ANTIGRAVITY-BYPASS-RUSSIA (v{})        \x1b[0m",
-        env!("CARGO_PKG_VERSION")
+        "\x1b[96m=====================================================================\x1b[0m"
     );
-    println!("\x1b[96m=====================================================\x1b[0m");
+    println!(
+        "\x1b[96m{:^69}\x1b[0m",
+        format!("ANTIGRAVITY-BYPASS-RUSSIA (v{})", env!("CARGO_PKG_VERSION"))
+    );
+    println!(
+        "\x1b[96m=====================================================================\x1b[0m"
+    );
     println!(" Открытая утилита обхода блокировок и чистого отката\n");
 }
 
 pub fn print_dashboard() {
-    let (nrpt_count, _, _) = get_nrpt_status_info();
-    let comp_status = get_quick_status();
-
-    let admin_str = if is_admin() {
-        "\x1b[92m[✓] Администратор\x1b[0m"
+    let (rules, _, _) = crate::net::nrpt::get_nrpt_status_info();
+    let running = crate::system::service::is_running();
+    let status = get_quick_status();
+    let title = " ТЕКУЩИЙ СТАТУС ";
+    let left = (67 - title.chars().count()) / 2;
+    let right = 67 - title.chars().count() - left;
+    println!(
+        "\x1b[90m╭{}\x1b[96m{}\x1b[90m{}╮\x1b[0m",
+        "─".repeat(left),
+        title,
+        "─".repeat(right)
+    );
+    println!("\x1b[90m│{}│\x1b[0m", " ".repeat(67));
+    let network = if rules > 0 && running {
+        "\x1b[92mВключён\x1b[0m"
+    } else if rules > 0 {
+        "\x1b[93mНужна проверка\x1b[0m"
     } else {
-        "\x1b[93m[!] Нет прав (запустите с правами администратора)\x1b[0m"
+        "\x1b[90mВыключен\x1b[0m"
     };
-
-    let dns_str = if nrpt_count > 0 {
-        "\x1b[92m[✓] Настроено\x1b[0m".to_string()
+    status_row("Обход:", network);
+    status_row("Antigravity:", component_status(status.core_status));
+    let ide = if !status.incomplete_ide_installations.is_empty() {
+        "\x1b[93mПереустановите Antigravity IDE\x1b[0m"
+    } else if !status.ide_installations.is_empty() {
+        "\x1b[92mУстановлена\x1b[0m"
     } else {
-        "\x1b[90m[Не настроено]\x1b[0m".to_string()
+        "\x1b[90mНе найдена\x1b[0m"
     };
-
-    let core_str = match comp_status.core_status {
-        Some(BinaryState::Patched) => "\x1b[92m[✓] Пропатчен\x1b[0m",
-        Some(BinaryState::Stock) => "\x1b[93m[Исходный]\x1b[0m",
-        Some(BinaryState::Unknown) => "\x1b[90m[Неизвестно]\x1b[0m",
-        None => "\x1b[90m[Не установлено]\x1b[0m",
+    status_row("Antigravity IDE:", ide);
+    let cli = if status.cli_status.is_none() && !status.cli_launchers.is_empty() {
+        "\x1b[93mНужна проверка\x1b[0m"
+    } else {
+        component_status(status.cli_status)
     };
+    status_row("Antigravity CLI:", cli);
+    println!("\x1b[90m│{}│\x1b[0m", " ".repeat(67));
+    println!("\x1b[90m╰{}╯\x1b[0m\n", "─".repeat(67));
+}
 
-    let ide_str = match comp_status.ide_status {
-        Some(BinaryState::Patched) => "\x1b[92m[✓] Пропатчен\x1b[0m",
-        Some(BinaryState::Stock) => "\x1b[93m[Исходный]\x1b[0m",
-        Some(BinaryState::Unknown) => "\x1b[90m[Неизвестно]\x1b[0m",
-        None => "\x1b[90m[Не установлено]\x1b[0m",
-    };
-
-    let cli_str = match comp_status.cli_status {
-        Some(BinaryState::Patched) => "\x1b[92m[✓] Пропатчен\x1b[0m",
-        Some(BinaryState::Stock) => "\x1b[93m[Исходный]\x1b[0m",
-        Some(BinaryState::Unknown) => "\x1b[90m[Неизвестно]\x1b[0m",
-        None => "\x1b[90m[Не установлено]\x1b[0m",
-    };
-
-    println!("\x1b[90m┌──────────────────── ТЕКУЩИЙ СТАТУС ────────────────────┐\x1b[0m");
-    println!("  • Права процесса:       {}", admin_str);
-    println!("  • Сеть и DNS (NRPT):    {}", dns_str);
-
-    let relay_str = if crate::system::service::is_running() {
-        "\x1b[92m[✓] 127.0.0.53:53\x1b[0m"
-    } else if crate::system::service::is_enabled() {
-        let _ = crate::system::service::start();
-        if crate::system::service::is_running() {
-            "\x1b[92m[✓] 127.0.0.53:53\x1b[0m"
-        } else {
-            "\x1b[93m[!] Зарегистрирован, не запущен\x1b[0m"
+fn component_status(status: Option<BinaryState>) -> &'static str {
+    match status {
+        Some(BinaryState::Patched) => "\x1b[92mПропатчено\x1b[0m",
+        Some(BinaryState::Stock) => "\x1b[93mНе пропатчено\x1b[0m",
+        Some(BinaryState::PartiallyPatched | BinaryState::Unknown) => {
+            "\x1b[93mНужна проверка\x1b[0m"
         }
-    } else {
-        "\x1b[90m[-- Выключен]\x1b[0m"
-    };
-    println!("  • DNS-релей:            {}", relay_str);
-    let watcher_str = if crate::core::watcher::is_watcher_running() {
-        "\x1b[92m[✓] Активен (авто-репатч)\x1b[0m"
-    } else {
-        "\x1b[90m[-- Отключен]\x1b[0m"
-    };
-    println!("  • Авто-репатчер:        {}", watcher_str);
-    println!("  • Antigravity 2.0 Core: {}", core_str);
-    println!("  • Antigravity IDE UI:   {}", ide_str);
-    println!("  • Antigravity CLI:      {}", cli_str);
-    if let Some(ver) = comp_status.asar_version {
-        println!("  • Версия в app.asar:    \x1b[96mv{}\x1b[0m", ver);
+        None => "\x1b[90mНе найдено\x1b[0m",
     }
-    println!("\x1b[90m└────────────────────────────────────────────────────────┘\x1b[0m\n");
+}
+
+// Pad the visible text, not ANSI colour sequences, to keep the right border straight.
+fn status_row(label: &str, status: &str) {
+    let (colour, icon) = if status.starts_with("\x1b[92m") {
+        ("\x1b[92m", "✓")
+    } else if status.starts_with("\x1b[93m") {
+        ("\x1b[93m", "!")
+    } else {
+        ("\x1b[90m", "–")
+    };
+    let text = status
+        .strip_prefix(colour)
+        .unwrap_or(status)
+        .strip_suffix("\x1b[0m")
+        .unwrap_or(status);
+    let prefix = format!("  {label:<18} ");
+    let padding = 67usize.saturating_sub(prefix.chars().count() + 4 + text.chars().count());
+    println!(
+        "\x1b[90m│\x1b[0m{prefix}{colour}[{icon}] {text}\x1b[0m{}\x1b[90m│\x1b[0m",
+        " ".repeat(padding)
+    );
 }

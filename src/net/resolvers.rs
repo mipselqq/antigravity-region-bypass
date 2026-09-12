@@ -1,7 +1,6 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -44,23 +43,15 @@ const CONTROL_NAMES: &[&str] = &[
     "ai.google.dev",
 ];
 
-const CHOICE_TTL: Duration = Duration::from_secs(30);
 const PROXY_SET_TTL: Duration = Duration::from_secs(30 * 60);
-const RACE_BUDGET: Duration = Duration::from_millis(1000);
+const RACE_BUDGET: Duration = Duration::from_millis(2800);
 const QUERY_TIMEOUT: Duration = Duration::from_millis(800);
-const LIVENESS_PORT: u16 = 443;
-const LIVENESS_BUDGET: Duration = Duration::from_millis(250);
-const TLS_PROBE_BUDGET: Duration = Duration::from_millis(1500);
-const LIVENESS_TTL_ALIVE: Duration = Duration::from_secs(10 * 60);
-const LIVENESS_TTL_DEAD: Duration = Duration::from_secs(60);
-
 static PROXY_SET: Mutex<Option<(HashMap<usize, Vec<IpAddr>>, Instant)>> = Mutex::new(None);
-static LIVENESS: Mutex<Option<HashMap<IpAddr, (bool, Instant)>>> = Mutex::new(None);
-static CHOICE: Mutex<Option<HashMap<(String, u16), (usize, Verdict, Instant)>>> = Mutex::new(None);
-const DNS_PACKET_CACHE_TTL: Duration = Duration::from_secs(300);
+const DNS_PACKET_CACHE_TTL: Duration = Duration::from_secs(20);
 static DNS_PACKET_CACHE: Mutex<
-    Option<HashMap<(String, u16), (Vec<u8>, &'static str, Verdict, Instant)>>,
+    Option<HashMap<(String, u16), (Vec<u8>, String, Verdict, Instant)>>,
 > = Mutex::new(None);
+static NETWORK_REVISION: AtomicU64 = AtomicU64::new(0);
 static ROTATION: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +64,7 @@ pub enum Verdict {
 
 pub struct ResolveHit {
     pub reply: Vec<u8>,
-    pub provider: &'static str,
+    pub provider: String,
     pub verdict: Verdict,
 }
 
@@ -85,10 +76,7 @@ pub fn all_provider_v4() -> Vec<&'static str> {
 }
 
 pub fn fallback_v4() -> Vec<&'static str> {
-    PROVIDERS
-        .iter()
-        .filter_map(|p| p.v4.first().copied())
-        .collect()
+    all_provider_v4()
 }
 
 fn parse_v4(s: &str) -> Option<Ipv4Addr> {
@@ -180,22 +168,24 @@ fn learn_proxy_addrs(if_index: u32) -> HashMap<usize, Vec<IpAddr>> {
         }
     }
 
-    let reference = reference_addrs("gemini.google.com", if_index);
     let mut map: HashMap<usize, Vec<IpAddr>> = HashMap::new();
 
     for (idx, provider) in PROVIDERS.iter().enumerate() {
         let mut learned = Vec::new();
-        let Some(server) = parse_v4(provider.v4[0]) else {
-            continue;
-        };
         for name in CONTROL_NAMES {
-            if let Some(resp) = query_a(name, server, if_index, QUERY_TIMEOUT) {
-                let addrs = answer_addrs(&resp);
-                let v = classify(&addrs, &reference, &[]);
-                if v == Verdict::Substituted {
-                    for a in addrs {
-                        if !learned.contains(&a) {
-                            learned.push(a);
+            let reference = reference_addrs(name, if_index);
+            for address in provider.v4 {
+                let Some(server) = parse_v4(address) else {
+                    continue;
+                };
+                if let Some(resp) = query_a(name, server, if_index, QUERY_TIMEOUT) {
+                    let addrs = answer_addrs(&resp);
+                    let v = classify(&addrs, &reference, &[]);
+                    if v == Verdict::Substituted {
+                        for a in addrs {
+                            if !learned.contains(&a) {
+                                learned.push(a);
+                            }
                         }
                     }
                 }
@@ -213,7 +203,7 @@ fn learn_proxy_addrs(if_index: u32) -> HashMap<usize, Vec<IpAddr>> {
 fn reference_addrs(name: &str, if_index: u32) -> Vec<IpAddr> {
     for ns in REFERENCE_V4 {
         if let Ok(ip) = ns.parse::<Ipv4Addr>() {
-            if let Some(resp) = query_a(name, ip, 0, QUERY_TIMEOUT) {
+            if let Some(resp) = query_a(name, ip, if_index, QUERY_TIMEOUT) {
                 let addrs: Vec<IpAddr> = answer_addrs(&resp)
                     .into_iter()
                     .filter(|a| match a {
@@ -233,7 +223,7 @@ fn reference_addrs(name: &str, if_index: u32) -> Vec<IpAddr> {
 
 /// TLS-ok IPv4s, fastest first. TCP-open is not enough: a proxy can accept
 /// SYN and still RST or stall the handshake.
-pub fn rank_tls_v4(addrs: &[IpAddr], sni: &str) -> Vec<(Ipv4Addr, u128)> {
+pub fn rank_paths_v4(addrs: &[IpAddr], sni: &str) -> Vec<(Ipv4Addr, u128)> {
     let candidates: Vec<IpAddr> = addrs.iter().copied().filter(|a| a.is_ipv4()).collect();
     if candidates.is_empty() {
         return Vec::new();
@@ -243,7 +233,7 @@ pub fn rank_tls_v4(addrs: &[IpAddr], sni: &str) -> Vec<(Ipv4Addr, u128)> {
         let sni = sni.to_string();
         let tx = tx.clone();
         thread::spawn(move || {
-            let _ = tx.send((addr, tls_handshake_ms(addr, &sni)));
+            let _ = tx.send((addr, path_latency_ms(addr, &sni)));
         });
     }
     drop(tx);
@@ -261,150 +251,58 @@ pub fn rank_tls_v4(addrs: &[IpAddr], sni: &str) -> Vec<(Ipv4Addr, u128)> {
     out
 }
 
-fn tls_handshake_ms(addr: IpAddr, sni: &str) -> Option<u128> {
-    let start = Instant::now();
-    let mut stream =
-        TcpStream::connect_timeout(&SocketAddr::new(addr, LIVENESS_PORT), TLS_PROBE_BUDGET).ok()?;
-    let left = TLS_PROBE_BUDGET.saturating_sub(start.elapsed());
-    if left.is_zero() {
-        return None;
-    }
-    crate::net::socket::configure_tcp_stream(&stream).ok()?;
-    stream.set_read_timeout(Some(left)).ok()?;
-    stream.set_write_timeout(Some(left)).ok()?;
-    stream.write_all(&tls_client_hello(sni)).ok()?;
-    let mut hdr = [0u8; 5];
-    stream.read_exact(&mut hdr).ok()?;
-    // Handshake (0x16) or alert (0x15) means a TLS speaker, not a SYN blackhole.
-    if hdr[0] != 0x16 && hdr[0] != 0x15 {
-        return None;
-    }
-    Some(start.elapsed().as_millis().max(1))
+pub(crate) fn path_latency_ms(addr: IpAddr, sni: &str) -> Option<u128> {
+    crate::net::health::check_ip(SocketAddr::new(addr, 443), sni, false).ok()
 }
 
-fn tls_client_hello(sni: &str) -> Vec<u8> {
-    let host = sni.as_bytes();
-    let mut ext = Vec::new();
-
-    let mut sni_name = Vec::new();
-    sni_name.push(0x00);
-    sni_name.extend_from_slice(&(host.len() as u16).to_be_bytes());
-    sni_name.extend_from_slice(host);
-    let mut sni_list = Vec::new();
-    sni_list.extend_from_slice(&(sni_name.len() as u16).to_be_bytes());
-    sni_list.extend(sni_name);
-    ext.extend_from_slice(&0x0000u16.to_be_bytes());
-    ext.extend_from_slice(&(sni_list.len() as u16).to_be_bytes());
-    ext.extend(sni_list);
-
-    let groups: &[u8] = &[0x00, 0x04, 0x00, 0x1d, 0x00, 0x17];
-    ext.extend_from_slice(&0x000au16.to_be_bytes());
-    ext.extend_from_slice(&(groups.len() as u16).to_be_bytes());
-    ext.extend_from_slice(groups);
-
-    let epf: &[u8] = &[0x01, 0x00];
-    ext.extend_from_slice(&0x000bu16.to_be_bytes());
-    ext.extend_from_slice(&(epf.len() as u16).to_be_bytes());
-    ext.extend_from_slice(epf);
-
-    let sig: &[u8] = &[0x00, 0x08, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x01];
-    ext.extend_from_slice(&0x000du16.to_be_bytes());
-    ext.extend_from_slice(&(sig.len() as u16).to_be_bytes());
-    ext.extend_from_slice(sig);
-
-    let mut ch = Vec::new();
-    ch.extend_from_slice(&[0x03, 0x03]);
-    ch.extend_from_slice(&[0u8; 32]);
-    ch.push(0);
-    ch.extend_from_slice(&[
-        0x00, 0x0c, 0x13, 0x01, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x13, 0x00, 0x9c, 0x00, 0x2f,
-    ]);
-    ch.push(0x01);
-    ch.push(0x00);
-    ch.extend_from_slice(&(ext.len() as u16).to_be_bytes());
-    ch.extend(ext);
-
-    let mut hs = Vec::new();
-    hs.push(0x01);
-    let n = ch.len();
-    hs.push(((n >> 16) & 0xff) as u8);
-    hs.push(((n >> 8) & 0xff) as u8);
-    hs.push((n & 0xff) as u8);
-    hs.extend(ch);
-
-    let mut rec = Vec::new();
-    rec.push(0x16);
-    rec.extend_from_slice(&[0x03, 0x01]);
-    rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
-    rec.extend(hs);
-    rec
+pub fn invalidate_network_caches() {
+    if let Ok(mut g) = DNS_PACKET_CACHE.lock() {
+        *g = None;
+    }
 }
 
-fn is_alive(addr: IpAddr) -> bool {
-    if let Ok(guard) = LIVENESS.lock() {
-        if let Some(map) = guard.as_ref() {
-            if let Some((ok, at)) = map.get(&addr) {
-                let ttl = if *ok {
-                    LIVENESS_TTL_ALIVE
-                } else {
-                    LIVENESS_TTL_DEAD
-                };
-                if at.elapsed() < ttl {
-                    return *ok;
-                }
-            }
-        }
-    }
-
-    let sock = SocketAddr::new(addr, LIVENESS_PORT);
-    let ok = TcpStream::connect_timeout(&sock, LIVENESS_BUDGET).is_ok();
-    if let Ok(mut guard) = LIVENESS.lock() {
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(addr, (ok, Instant::now()));
-    }
-    ok
-}
-
-fn drop_dead(reply: &[u8]) -> Vec<u8> {
+fn drop_dead(reply: &[u8], host: &str) -> Option<Vec<u8>> {
     let addrs = answer_addrs(reply);
     if addrs.is_empty() {
-        return reply.to_vec();
+        return Some(reply.to_vec());
     }
-    let dead = probe_dead(&addrs);
-    if dead.is_empty() || dead.len() == addrs.len() {
-        return reply.to_vec();
+    let dead = probe_dead(&addrs, host);
+    if dead.len() == addrs.len() {
+        return None;
     }
-    without_addrs(reply, &dead).unwrap_or_else(|| reply.to_vec())
+    if dead.is_empty() {
+        return Some(reply.to_vec());
+    }
+    without_addrs(reply, &dead)
 }
 
-fn probe_dead(addrs: &[IpAddr]) -> Vec<IpAddr> {
-    if addrs.len() == 1 {
-        return if is_alive(addrs[0]) {
-            Vec::new()
-        } else {
-            vec![addrs[0]]
-        };
-    }
-    let (tx, rx) = mpsc::channel();
-    for addr in addrs {
-        let addr = *addr;
-        let tx = tx.clone();
-        thread::spawn(move || {
-            let _ = tx.send((addr, is_alive(addr)));
-        });
-    }
-    drop(tx);
-    let mut dead = Vec::new();
-    while let Ok((addr, ok)) = rx.recv() {
-        if !ok {
-            dead.push(addr);
-        }
-    }
-    dead
+fn probe_dead(addrs: &[IpAddr], host: &str) -> Vec<IpAddr> {
+    thread::scope(|scope| {
+        let jobs: Vec<_> = addrs
+            .iter()
+            .take(32)
+            .map(|addr| {
+                (
+                    *addr,
+                    scope.spawn(move || {
+                        crate::net::health::check_ip(SocketAddr::new(*addr, 443), host, false)
+                            .is_ok()
+                    }),
+                )
+            })
+            .collect();
+        let mut dead: Vec<_> = jobs
+            .into_iter()
+            .filter_map(|(addr, j)| (!j.join().unwrap_or(false)).then_some(addr))
+            .collect();
+        dead.extend(addrs.iter().skip(32));
+        dead
+    })
 }
 
 struct RaceResult {
     idx: usize,
+    provider: String,
     reply: Vec<u8>,
     addrs: Vec<IpAddr>,
 }
@@ -429,6 +327,7 @@ fn race_providers(query: &[u8], if_index: u32) -> (Vec<RaceResult>, Vec<IpAddr>)
                         let addrs = answer_addrs(&resp);
                         let _ = tx.send(RaceMsg::Provider(RaceResult {
                             idx,
+                            provider: provider.name.into(),
                             reply: resp,
                             addrs,
                         }));
@@ -437,6 +336,48 @@ fn race_providers(query: &[u8], if_index: u32) -> (Vec<RaceResult>, Vec<IpAddr>)
             });
         }
     }
+    match super::config::load() {
+        Ok(config) => {
+            for (offset, provider) in config.extra_udp.into_iter().enumerate() {
+                for ip in provider.addresses {
+                    let q = query.to_vec();
+                    let tx = tx.clone();
+                    let name = provider.name.clone();
+                    thread::spawn(move || {
+                        if let Ok(reply) = query_raw_via(&q, ip, if_index, QUERY_TIMEOUT) {
+                            let addrs = answer_addrs(&reply);
+                            if is_successful_response(&reply) && !addrs.is_empty() {
+                                let _ = tx.send(RaceMsg::Provider(RaceResult {
+                                    idx: PROVIDERS.len() + offset,
+                                    provider: name,
+                                    reply,
+                                    addrs,
+                                }));
+                            }
+                        }
+                    });
+                }
+            }
+            for (offset, provider) in config.doh.into_iter().enumerate() {
+                let q = query.to_vec();
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    if let Ok(reply) = super::dns_https::query(&provider, &q, if_index) {
+                        let addrs = answer_addrs(&reply);
+                        if is_successful_response(&reply) && !addrs.is_empty() {
+                            let _ = tx.send(RaceMsg::Provider(RaceResult {
+                                idx: PROVIDERS.len() + 8 + offset,
+                                provider: provider.name,
+                                reply,
+                                addrs,
+                            }));
+                        }
+                    }
+                });
+            }
+        }
+        Err(e) => super::relay::log_event(&e),
+    }
     for ns in REFERENCE_V4 {
         let q = query.to_vec();
         let tx = tx.clone();
@@ -444,7 +385,7 @@ fn race_providers(query: &[u8], if_index: u32) -> (Vec<RaceResult>, Vec<IpAddr>)
             continue;
         };
         thread::spawn(move || {
-            if let Ok(resp) = query_raw_via(&q, ip, 0, QUERY_TIMEOUT) {
+            if let Ok(resp) = query_raw_via(&q, ip, if_index, QUERY_TIMEOUT) {
                 let addrs: Vec<IpAddr> = answer_addrs(&resp)
                     .into_iter()
                     .filter(|a| match a {
@@ -476,6 +417,36 @@ fn race_providers(query: &[u8], if_index: u32) -> (Vec<RaceResult>, Vec<IpAddr>)
         }
     }
     (out, reference)
+}
+
+/// Gather independent candidates from every responding nameserver, not just
+/// the DNS race winner. TLS ranking below decides which endpoints are usable.
+pub fn substituted_ips(name: &str, if_index: u32) -> Vec<IpAddr> {
+    let (hits, reference) = race_providers(&build_query(name, 0xA652), if_index);
+    let proxy = cached_proxy();
+    collect_substituted(&hits, &reference, &proxy)
+}
+fn collect_substituted(
+    hits: &[RaceResult],
+    reference: &[IpAddr],
+    proxy: &HashMap<usize, Vec<IpAddr>>,
+) -> Vec<IpAddr> {
+    let mut addresses = Vec::new();
+    for hit in hits {
+        if classify(
+            &hit.addrs,
+            reference,
+            proxy.get(&hit.idx).map(Vec::as_slice).unwrap_or(&[]),
+        ) == Verdict::Substituted
+        {
+            for ip in &hit.addrs {
+                if !addresses.contains(ip) {
+                    addresses.push(*ip);
+                }
+            }
+        }
+    }
+    addresses
 }
 
 pub(crate) fn looks_google(addr: &IpAddr) -> bool {
@@ -515,7 +486,8 @@ fn pick_winner(hits: &[RaceResult], reference: &[IpAddr], if_index: u32) -> Opti
     let mut rest: Vec<usize> = Vec::new();
     for (i, hit) in hits.iter().enumerate() {
         let proxy_addrs = proxy.get(&hit.idx).cloned().unwrap_or_default();
-        if classify(&hit.addrs, reference, &proxy_addrs) == Verdict::Substituted
+        if hit.idx == usize::MAX
+            || classify(&hit.addrs, reference, &proxy_addrs) == Verdict::Substituted
             || (reference.is_empty() && hit.addrs.iter().any(|a| !looks_google(a)))
         {
             best_sub.push(i);
@@ -531,13 +503,7 @@ fn pick_winner(hits: &[RaceResult], reference: &[IpAddr], if_index: u32) -> Opti
     Some(pool[rot % pool.len()])
 }
 
-fn cache_dns_packet(
-    name: String,
-    qtype: u16,
-    reply: Vec<u8>,
-    provider: &'static str,
-    verdict: Verdict,
-) {
+fn cache_dns_packet(name: String, qtype: u16, reply: Vec<u8>, provider: &str, verdict: Verdict) {
     if verdict != Verdict::Substituted {
         return;
     }
@@ -546,110 +512,202 @@ fn cache_dns_packet(
         if cmap.len() >= 64 {
             cmap.retain(|_, (_, _, _, at)| at.elapsed() < DNS_PACKET_CACHE_TTL);
         }
-        cmap.insert((name, qtype), (reply, provider, verdict, Instant::now()));
+        cmap.insert(
+            (name, qtype),
+            (reply, provider.to_string(), verdict, Instant::now()),
+        );
     }
 }
 
 pub fn resolve_best(query: &[u8], if_index: u32) -> Option<ResolveHit> {
-    let name = question_name(query).unwrap_or_else(|| "?".into());
-    let qtype = question_type(query).unwrap_or(1);
-
-    // 1. High-speed in-memory DNS packet cache (0.01ms response from RAM)
-    if let Ok(guard) = DNS_PACKET_CACHE.lock() {
-        if let Some(map) = guard.as_ref() {
-            if let Some((cached_reply, provider, verdict, at)) = map.get(&(name.clone(), qtype)) {
-                if at.elapsed() < DNS_PACKET_CACHE_TTL {
-                    let mut fast_reply = cached_reply.clone();
-                    if query.len() >= 2 && fast_reply.len() >= 2 {
-                        // Stamp incoming query's Transaction ID
-                        fast_reply[0] = query[0];
-                        fast_reply[1] = query[1];
-                    }
-                    return Some(ResolveHit {
-                        reply: fast_reply,
-                        provider,
-                        verdict: *verdict,
-                    });
-                }
-            }
-        }
+    let name = question_name(query)?.to_ascii_lowercase();
+    let qtype = question_type(query)?;
+    let state = super::route_health::store().snapshot().ok()?;
+    let revision = state.revision;
+    if NETWORK_REVISION.swap(revision, Ordering::SeqCst) != revision {
+        invalidate_network_caches();
     }
-
-    if let Ok(guard) = CHOICE.lock() {
-        if let Some(map) = guard.as_ref() {
-            if let Some((idx, verdict, at)) = map.get(&(name.clone(), qtype)) {
-                if at.elapsed() < CHOICE_TTL {
-                    for s in PROVIDERS[*idx].v4 {
-                        let Some(ip) = parse_v4(s) else { continue };
-                        if let Ok(resp) = query_raw_via(query, ip, if_index, QUERY_TIMEOUT) {
-                            if is_successful_response(&resp) && !answer_addrs(&resp).is_empty() {
-                                let reply = drop_dead(&resp);
-                                let provider = PROVIDERS[*idx].name;
-                                cache_dns_packet(
-                                    name.clone(),
-                                    qtype,
-                                    reply.clone(),
-                                    provider,
-                                    *verdict,
-                                );
-                                return Some(ResolveHit {
-                                    reply,
-                                    provider,
-                                    verdict: *verdict,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let (hits, reference) = race_providers(query, if_index);
-    if let Some(win) = pick_winner(&hits, &reference, if_index) {
-        let hit = &hits[win];
-        let proxy = cached_proxy();
-        let proxy_addrs = proxy.get(&hit.idx).cloned().unwrap_or_default();
-        let verdict = classify(&hit.addrs, &reference, &proxy_addrs);
-        let final_reply = drop_dead(&hit.reply);
-        let provider = PROVIDERS[hit.idx].name;
-
-        // Populate in-memory packet cache
-        if is_successful_response(&final_reply) && !answer_addrs(&final_reply).is_empty() {
-            cache_dns_packet(name.clone(), qtype, final_reply.clone(), provider, verdict);
-        }
-
-        if verdict == Verdict::Substituted {
-            if let Ok(mut guard) = CHOICE.lock() {
-                let map = guard.get_or_insert_with(HashMap::new);
-                map.insert((name, qtype), (hit.idx, verdict, Instant::now()));
-            }
-        }
-        return Some(ResolveHit {
-            reply: final_reply,
-            provider,
-            verdict,
-        });
-    }
-
-    for ns in REFERENCE_V4 {
-        let Ok(ip) = ns.parse::<Ipv4Addr>() else {
-            continue;
-        };
-        if let Ok(resp) = query_raw_via(query, ip, 0, QUERY_TIMEOUT) {
-            if is_successful_response(&resp) && !answer_addrs(&resp).is_empty() {
-                let provider = "system";
-                let verdict = Verdict::Passthrough;
-                cache_dns_packet(name, qtype, resp.clone(), provider, verdict);
+    let cached = DNS_PACKET_CACHE.lock().ok().and_then(|g| {
+        g.as_ref()
+            .and_then(|m| m.get(&(name.clone(), qtype)).cloned())
+    });
+    if let Some((mut reply, provider, verdict, at)) = cached {
+        if at.elapsed() < DNS_PACKET_CACHE_TTL {
+            reply[..2].copy_from_slice(&query[..2]);
+            if let Some(reply) = drop_dead(&reply, &name)
+                .and_then(|r| super::client::age_ttls(&r, at.elapsed().as_secs() as u32, 20))
+            {
                 return Some(ResolveHit {
-                    reply: resp,
+                    reply,
                     provider,
                     verdict,
                 });
             }
         }
+        if let Ok(mut g) = DNS_PACKET_CACHE.lock() {
+            if let Some(m) = g.as_mut() {
+                m.remove(&(name.clone(), qtype));
+            }
+        }
+    }
+    // A fresh ranked route is already verified: do not make the first client
+    // DNS request wait for all external DNS timeouts after the relay starts.
+    let ranked = if super::provider::NRPT_AGENT.contains(&name.as_str()) {
+        super::rank::candidates_for(&name)
+    } else {
+        vec![]
+    };
+    if qtype == 1 {
+        let keys = fresh_ranked_keys(&name, &ranked, &state, super::route_health::now_ms());
+        if !keys.is_empty() {
+            if let Some(key) = super::route_health::order(&keys).ok()?.first() {
+                if let Ok(SocketAddr::V4(addr)) = key.route.parse::<SocketAddr>() {
+                    let reply = super::client::address_response(query, &[*addr.ip()])?;
+                    cache_dns_packet(
+                        name,
+                        qtype,
+                        reply.clone(),
+                        "ranked-sni",
+                        Verdict::Substituted,
+                    );
+                    return Some(ResolveHit {
+                        reply,
+                        provider: "ranked-sni".into(),
+                        verdict: Verdict::Substituted,
+                    });
+                }
+            }
+        }
+    }
+    let (mut hits, reference) = race_providers(query, if_index);
+    // The relay replaces our hosts pins, including verified seed routes when
+    // SmartDNS returns ordinary Google addresses (for example behind a VPN).
+    if super::provider::NRPT_AGENT.contains(&name.as_str()) {
+        if let Some(hit) = ranked_hit(query, &ranked) {
+            hits.push(hit);
+        }
+    }
+    // Probe unique addresses once, in parallel, regardless of how many DNS servers returned them.
+    let mut addresses = Vec::new();
+    for hit in &hits {
+        for addr in &hit.addrs {
+            if !addresses.contains(addr) {
+                addresses.push(*addr);
+            }
+        }
+    }
+    let dead = probe_dead(&addresses, &name);
+    let hits: Vec<_> = hits
+        .into_iter()
+        .filter_map(|mut h| {
+            if h.addrs.iter().all(|a| dead.contains(a)) {
+                return None;
+            }
+            if h.addrs.iter().any(|a| dead.contains(a)) {
+                h.reply = without_addrs(&h.reply, &dead)?;
+            }
+            h.addrs = answer_addrs(&h.reply);
+            Some(h)
+        })
+        .collect();
+    if let Some(initial) = pick_winner(&hits, &reference, if_index) {
+        let proxy = cached_proxy();
+        let verdict_of = |h: &RaceResult| {
+            if h.idx == usize::MAX {
+                Verdict::Substituted
+            } else {
+                classify(
+                    &h.addrs,
+                    &reference,
+                    proxy.get(&h.idx).map(Vec::as_slice).unwrap_or(&[]),
+                )
+            }
+        };
+        let wanted = verdict_of(&hits[initial]);
+        let keys: Vec<_> = hits
+            .iter()
+            .filter(|h| verdict_of(h) == wanted)
+            .flat_map(|h| {
+                h.addrs
+                    .iter()
+                    .map(|ip| super::route_health::Key::ip(&name, SocketAddr::new(*ip, 443)))
+            })
+            .collect();
+        let order = super::route_health::order(&keys).ok()?;
+        let win = order
+            .first()
+            .and_then(|key| key.route.parse::<SocketAddr>().ok())
+            .and_then(|addr| {
+                hits.iter()
+                    .position(|h| verdict_of(h) == wanted && h.addrs.contains(&addr.ip()))
+            })
+            .unwrap_or(initial);
+        let hit = &hits[win];
+        // Prefer one measured address so a subsequent refusal can be tied to this answer.
+        // The remaining verified IPs stay in the route table for failover on the next query.
+        let primary = order
+            .first()
+            .and_then(|key| key.route.parse::<SocketAddr>().ok())
+            .map(|a| a.ip());
+        let other: Vec<_> = hit
+            .addrs
+            .iter()
+            .filter(|a| Some(**a) != primary)
+            .copied()
+            .collect();
+        let selected = if qtype == 1 && primary.is_some() && !other.is_empty() {
+            without_addrs(&hit.reply, &other).unwrap_or_else(|| hit.reply.clone())
+        } else {
+            hit.reply.clone()
+        };
+        let reply = super::client::age_ttls(&selected, 0, 20)?;
+        cache_dns_packet(name, qtype, reply.clone(), &hit.provider, wanted);
+        return Some(ResolveHit {
+            reply,
+            provider: hit.provider.clone(),
+            verdict: wanted,
+        });
+    }
+    // A regular answer is not a successful bypass; the caller can still distinguish it.
+    for ns in REFERENCE_V4 {
+        let Ok(ip) = ns.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        if let Ok(reply) = query_raw_via(query, ip, if_index, QUERY_TIMEOUT) {
+            if is_successful_response(&reply) && !answer_addrs(&reply).is_empty() {
+                let reply = super::client::age_ttls(&drop_dead(&reply, &name)?, 0, 20)?;
+                return Some(ResolveHit {
+                    reply,
+                    provider: "reference".into(),
+                    verdict: Verdict::Passthrough,
+                });
+            }
+        }
     }
     None
+}
+
+fn ranked_hit(query: &[u8], addresses: &[Ipv4Addr]) -> Option<RaceResult> {
+    let reply = super::client::address_response(query, addresses)?;
+    Some(RaceResult {
+        idx: usize::MAX,
+        provider: "ranked-sni".into(),
+        addrs: answer_addrs(&reply),
+        reply,
+    })
+}
+
+fn fresh_ranked_keys(
+    name: &str,
+    addresses: &[Ipv4Addr],
+    state: &super::route_health::State,
+    now: u64,
+) -> Vec<super::route_health::Key> {
+    addresses
+        .iter()
+        .map(|ip| super::route_health::Key::ip(name, (*ip, 443).into()))
+        .filter(|key| state.cached(key, now) == Some(true))
+        .collect()
 }
 
 /// Nameserver IPs (not the relay) that currently substitute `name`.
@@ -666,21 +724,19 @@ pub fn substituting_addrs(name: &str, if_index: u32) -> Vec<&'static str> {
     };
     let mut out = Vec::new();
     for (idx, provider) in PROVIDERS.iter().enumerate() {
-        let Some(server) = parse_v4(provider.v4[0]) else {
-            continue;
-        };
-        let Some(resp) = query_a(name, server, if_index, QUERY_TIMEOUT) else {
-            continue;
-        };
-        let addrs = answer_addrs(&resp);
-        let proxy_addrs = proxy.get(&idx).cloned().unwrap_or_default();
-        let substituted = classify(&addrs, &reference, &proxy_addrs) == Verdict::Substituted
-            || (reference.is_empty() && addrs.iter().any(|a| !looks_google(a)));
-        if substituted {
-            if let Some(first) = provider.v4.first() {
-                if !out.contains(first) {
-                    out.push(*first);
-                }
+        for address in provider.v4 {
+            let Some(server) = parse_v4(address) else {
+                continue;
+            };
+            let Some(resp) = query_a(name, server, if_index, QUERY_TIMEOUT) else {
+                continue;
+            };
+            let addrs = answer_addrs(&resp);
+            let proxy_addrs = proxy.get(&idx).cloned().unwrap_or_default();
+            let substituted = classify(&addrs, &reference, &proxy_addrs) == Verdict::Substituted
+                || (reference.is_empty() && addrs.iter().any(|a| !looks_google(a)));
+            if substituted && !out.contains(address) {
+                out.push(*address);
             }
         }
     }
@@ -700,10 +756,78 @@ pub fn verdict_tag(v: Verdict) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn relay_keeps_ranked_routes_when_external_dns_only_passes_through() {
+        let query = build_query("cloudcode-pa.googleapis.com", 9);
+        let ranked = ranked_hit(&query, &["37.230.192.51".parse().unwrap()]).unwrap();
+        assert!(super::super::client::response_matches(
+            &query,
+            &ranked.reply
+        ));
+        let hits = vec![
+            RaceResult {
+                idx: 0,
+                provider: "fixture".into(),
+                reply: vec![],
+                addrs: vec![v4(142, 250, 1, 1)],
+            },
+            ranked,
+        ];
+        assert_eq!(pick_winner(&hits, &[v4(142, 250, 1, 1)], 0), Some(1));
+    }
+
+    #[test]
+    fn fast_dns_answer_requires_fresh_host_specific_route_without_region_penalty() {
+        let ip: Ipv4Addr = "127.0.0.1".parse().unwrap();
+        let key =
+            super::super::route_health::Key::ip("cloudcode-pa.googleapis.com", (ip, 443).into());
+        let mut state = super::super::route_health::State::default();
+        state.record(&key, Ok(100), 1);
+        assert_eq!(
+            fresh_ranked_keys(&key.host, &[ip], &state, 2),
+            vec![key.clone()]
+        );
+        assert!(
+            fresh_ranked_keys("daily-cloudcode-pa.googleapis.com", &[ip], &state, 2).is_empty()
+        );
+        assert!(fresh_ranked_keys(&key.host, &[ip], &state, 20_002).is_empty());
+        state.note_used(&key, 2);
+        state.region_refusal("event", Some(&key.host), None, 3);
+        assert!(fresh_ranked_keys(&key.host, &[ip], &state, 4).is_empty());
+    }
+
     fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
     }
 
+    #[test]
+    fn fallback_keeps_all_seven_nameservers_and_ranking_keeps_each_provider() {
+        assert_eq!(fallback_v4().len(), 7);
+        let hits = vec![
+            RaceResult {
+                idx: 0,
+                provider: "fixture".into(),
+                reply: vec![],
+                addrs: vec![v4(142, 250, 1, 1)],
+            },
+            RaceResult {
+                idx: 1,
+                provider: "fixture".into(),
+                reply: vec![],
+                addrs: vec![v4(45, 155, 204, 190)],
+            },
+            RaceResult {
+                idx: 2,
+                provider: "fixture".into(),
+                reply: vec![],
+                addrs: vec![v4(37, 230, 192, 51), v4(45, 155, 204, 190)],
+            },
+        ];
+        assert_eq!(
+            collect_substituted(&hits, &[v4(142, 250, 1, 1)], &HashMap::new()),
+            vec![v4(45, 155, 204, 190), v4(37, 230, 192, 51)]
+        );
+    }
     #[test]
     fn passthrough_packets_are_not_cached() {
         let name = "passthrough-regression.invalid".to_string();
@@ -724,11 +848,13 @@ mod tests {
         let hits = vec![
             RaceResult {
                 idx: 0,
+                provider: "fixture".into(),
                 reply: vec![],
                 addrs: vec![v4(142, 250, 1, 1)],
             },
             RaceResult {
                 idx: 2,
+                provider: "fixture".into(),
                 reply: vec![],
                 addrs: vec![v4(45, 155, 204, 190)],
             },

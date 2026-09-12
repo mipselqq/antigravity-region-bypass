@@ -1,355 +1,489 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use crate::core::asar::{asar_js_is_patched, patch_asar_main_js, restore_asar_main_js};
-use crate::core::detector::{FoundTarget, TargetKind};
-use crate::core::opcodes::*;
-use crate::system::fs_utils::robust_write_file;
-use crate::system::process::kill_processes;
+use crate::core::{
+    detector::{FoundTarget, TargetKind},
+    opcodes::*,
+};
+use crate::system::journal;
+use object::{Architecture, Object, ObjectSection, SectionKind};
+use std::{
+    fs,
+    path::Path,
+    sync::{Mutex, MutexGuard},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryState {
     Patched,
+    PartiallyPatched,
     Stock,
     Unknown,
 }
 
-static BINARY_STATE_CACHE: Mutex<Option<HashMap<PathBuf, (u64, BinaryState)>>> = Mutex::new(None);
-
-pub fn invalidate_binary_cache() {
-    if let Ok(mut lock) = BINARY_STATE_CACHE.lock() {
-        *lock = None;
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchOutcome {
+    Changed(usize),
+    AlreadyPatched,
+    Restored,
+    AlreadyStock,
+    NotApplicable,
 }
-
-pub fn check_binary_state(path: &Path) -> BinaryState {
-    let mtime = fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    if let Ok(mut lock) = BINARY_STATE_CACHE.lock() {
-        let cache = lock.get_or_insert_with(HashMap::new);
-        if let Some((cached_mtime, state)) = cache.get(path) {
-            if *cached_mtime == mtime && mtime > 0 {
-                return *state;
-            }
+impl std::fmt::Display for PatchOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Changed(n) => write!(f, "Изменено {n} проверенных участков; backup сохранён"),
+            Self::AlreadyPatched => write!(f, "Все поддерживаемые участки уже пропатчены"),
+            Self::Restored => write!(f, "Точные исходные байты восстановлены"),
+            Self::AlreadyStock => write!(f, "Исходное состояние; изменений нет"),
+            Self::NotApplicable => write!(
+                f,
+                "Поддерживаемых участков патча нет; файл оставлен без изменений"
+            ),
         }
     }
-
-    let state = check_binary_state_uncached(path);
-    if let Ok(mut lock) = BINARY_STATE_CACHE.lock() {
-        if let Some(cache) = lock.as_mut() {
-            cache.insert(path.to_path_buf(), (mtime, state));
-        }
-    }
-    state
+}
+static OPERATIONS: Mutex<()> = Mutex::new(());
+pub fn operation_guard() -> MutexGuard<'static, ()> {
+    OPERATIONS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn check_binary_state_uncached(path: &Path) -> BinaryState {
-    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-    if file_name.ends_with(".asar") {
-        return match asar_js_is_patched(path) {
-            Some(true) => BinaryState::Patched,
-            Some(false) => BinaryState::Stock,
-            None => BinaryState::Unknown,
-        };
-    }
-
-    let Ok(mut file) = File::open(path) else {
-        return BinaryState::Unknown;
-    };
-    let mut data = Vec::new();
-    if file.read_to_end(&mut data).is_err() {
-        return BinaryState::Unknown;
-    }
-
-    if file_name.ends_with(".js") {
-        let Ok(text) = String::from_utf8(data) else {
-            return BinaryState::Unknown;
-        };
-        if regex_ide_js_patched().is_match(&text) {
-            return BinaryState::Patched;
-        }
-        if regex_ide_main_js_stock().is_match(&text) {
-            return BinaryState::Stock;
-        }
-        return BinaryState::Unknown;
-    }
-
-    static FINDER_TO: std::sync::OnceLock<memchr::memmem::Finder<'static>> = std::sync::OnceLock::new();
-    static FINDER_FROM: std::sync::OnceLock<memchr::memmem::Finder<'static>> = std::sync::OnceLock::new();
-
-    let finder_to = FINDER_TO.get_or_init(|| memchr::memmem::Finder::new(STRING_TO.as_bytes()));
-    let finder_from = FINDER_FROM.get_or_init(|| memchr::memmem::Finder::new(STRING_FROM.as_bytes()));
-
-    if finder_to.find(&data).is_some() {
-        return BinaryState::Patched;
-    }
-
-    if regex_mgr_x64_patched().is_match(&data)
-        || regex_mgr_arm64_patched().is_match(&data)
-        || regex_cli_x64_patched().is_match(&data)
-        || regex_cli_x64_long_patched().is_match(&data)
-    {
-        return BinaryState::Patched;
-    }
-
-    if regex_mgr_x64_orig().is_match(&data)
-        || regex_mgr_arm64_orig().is_match(&data)
-        || regex_cli_x64_orig().is_match(&data)
-        || regex_cli_x64_long_orig().is_match(&data)
-    {
-        return BinaryState::Stock;
-    }
-
-    if finder_from.find(&data).is_some() {
-        return BinaryState::Stock;
-    }
-
-    BinaryState::Unknown
+pub(crate) struct Plan {
+    pub data: Vec<u8>,
+    pub changes: usize,
+    pub existing: usize,
+    pub profile: String,
 }
-
-pub fn patch_target(target: &FoundTarget) -> Result<String, String> {
-    invalidate_binary_cache();
-    kill_processes();
-    match target.kind {
-        TargetKind::IdeMainJs => patch_main_js(&target.path),
-        TargetKind::IdeAsar => patch_asar_main_js(&target.path),
-        TargetKind::LanguageServer | TargetKind::AgyCli => patch_binary_file(&target.path),
+pub(crate) fn state_from_counts(stock: usize, patched: usize) -> BinaryState {
+    match (stock > 0, patched > 0) {
+        (true, true) => BinaryState::PartiallyPatched,
+        (true, false) => BinaryState::Stock,
+        (false, true) => BinaryState::Patched,
+        _ => BinaryState::Unknown,
     }
 }
-
-pub fn restore_target(target: &FoundTarget) -> Result<String, String> {
-    invalidate_binary_cache();
-    kill_processes();
-    match target.kind {
-        TargetKind::IdeMainJs => restore_main_js(&target.path),
-        TargetKind::IdeAsar => restore_asar_main_js(&target.path),
-        TargetKind::LanguageServer | TargetKind::AgyCli => restore_binary_file(&target.path),
-    }
-}
-
-fn patch_main_js(path: &Path) -> Result<String, String> {
-    let data = fs::read(path).map_err(|e| format!("Ошибка чтения {}: {}", path.display(), e))?;
-    let content = String::from_utf8(data).map_err(|e| format!("Файл не в UTF-8: {}", e))?;
-
-    if regex_ide_js_patched().is_match(&content) {
-        return Ok("Уже пропатчен (isGoogleInternal -> true)".to_string());
-    }
-
-    let bak_path = path.with_extension("js.bak");
-    if !bak_path.exists() {
-        let _ = fs::copy(path, &bak_path);
-    }
-
+pub(crate) fn plan_js(data: &[u8]) -> Result<Plan, String> {
+    let text = std::str::from_utf8(data).map_err(|_| "JavaScript не в UTF-8")?;
+    let mut output = data.to_vec();
     let re = regex_ide_main_js_stock();
-    let spans: Vec<(usize, usize, usize)> = re
-        .captures_iter(&content)
-        .filter_map(|c| {
-            let full = c.get(0)?;
-            let prefix = c.get(1)?;
-            Some((full.start(), prefix.end(), full.end()))
-        })
+    let spans: Vec<_> = re
+        .captures_iter(text)
+        .map(|c| (c.get(1).unwrap().end(), c.get(0).unwrap().end()))
         .collect();
-
-    if spans.is_empty() {
-        return Err("Сигнатура isGoogleInternal не найдена".to_string());
+    let existing = regex_ide_js_patched().find_iter(text).count();
+    for (start, end) in &spans {
+        output[*start..*end].fill(b' ');
+        output[*start..*start + 4].copy_from_slice(b"true");
     }
+    Ok(Plan {
+        data: output,
+        changes: spans.len(),
+        existing,
+        profile: "ide-reset-tier-v1".into(),
+    })
+}
 
-    let mut new_content = content;
-    for (_start, prefix_end, end) in spans.iter().copied().rev() {
-        let rest_len = end - prefix_end;
-        if rest_len < 4 {
+fn apply_pattern(
+    bytes: &mut [u8],
+    original: &regex::bytes::Regex,
+    patched: &regex::bytes::Regex,
+    fix: &[u8],
+) -> Result<(usize, usize), String> {
+    let offsets: Vec<_> = original.find_iter(bytes).map(|m| m.start()).collect();
+    let existing = patched.find_iter(bytes).count();
+    if offsets.len() + existing > 1 {
+        return Err("Неоднозначная машинная сигнатура; файл не изменён".into());
+    }
+    for offset in &offsets {
+        bytes[*offset..*offset + fix.len()].copy_from_slice(fix);
+    }
+    Ok((offsets.len(), existing))
+}
+
+fn plan_binary(data: &[u8], kind: TargetKind) -> Result<Plan, String> {
+    let file = object::File::parse(data)
+        .map_err(|e| format!("Неподдерживаемый executable (PE/ELF/Mach-O): {e}"))?;
+    let (original, patched, fix, profile) = match (kind, file.architecture()) {
+        (TargetKind::LanguageServer, Architecture::X86_64) => (
+            regex_mgr_x64_orig(),
+            regex_mgr_x64_patched(),
+            MGR_GATE_X64_FIX,
+            "core-x64-v1",
+        ),
+        (TargetKind::LanguageServer, Architecture::Aarch64) => (
+            regex_mgr_arm64_orig(),
+            regex_mgr_arm64_patched(),
+            MGR_GATE_ARM64_FIX,
+            "core-arm64-v1",
+        ),
+        (TargetKind::AgyCli, Architecture::X86_64) => (
+            regex_cli_x64_long_orig(),
+            regex_cli_x64_long_patched(),
+            CLI_GATE_X64_LONG_FIX,
+            "agy-x64-long-v1",
+        ),
+        _ => return Err("Нет профиля патча для этой архитектуры/компонента".into()),
+    };
+    let mut output = data.to_vec();
+    let (mut changes, mut existing) = (0, 0);
+    for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
+        let Some((offset, size)) = section.file_range() else {
             continue;
-        }
-        let replacement = format!("true{}", " ".repeat(rest_len - 4));
-        new_content.replace_range(prefix_end..end, &replacement);
-    }
-
-    let count = regex_ide_js_patched().find_iter(&new_content).count();
-    if count == 0 {
-        return Err("Не удалось сохранить размер при патче main.js".to_string());
-    }
-
-    robust_write_file(path, new_content.as_bytes())?;
-    Ok(format!("Пропатчен успешно (замен: {}, размер сохранён)", count))
-}
-
-fn restore_main_js(path: &Path) -> Result<String, String> {
-    let bak_candidates = [
-        path.with_extension("js.bak"),
-        path.with_extension("bak"),
-        path.with_extension("js.original"),
-    ];
-
-    for bak in &bak_candidates {
-        if bak.exists() {
-            if let Ok(data) = fs::read(bak) {
-                if data.len() > 100 {
-                    robust_write_file(path, &data)?;
-                    return Ok("Восстановлен из бэкапа (.bak)".to_string());
-                }
-            }
-        }
-    }
-
-    let data = fs::read(path).map_err(|e| format!("Ошибка чтения: {}", e))?;
-    let content = String::from_utf8_lossy(&data);
-    if let Ok(re) = regex::Regex::new(r"(resetIsTierGCPTos\(\)[ \t\r\n]*[,;][ \t\r\n]*)true[ \t\r\n]*") {
-        if re.is_match(&content) {
-            let restored = re.replace_all(&content, "${1}this.isGoogleInternal").to_string();
-            robust_write_file(path, restored.as_bytes())?;
-            return Ok("Откат main.js выполнен без .bak".to_string());
-        }
-    }
-
-    Ok("Уже в исходном состоянии".to_string())
-}
-
-fn patch_binary_file(path: &Path) -> Result<String, String> {
-    let mut data = fs::read(path).map_err(|e| format!("Ошибка чтения {}: {}", path.display(), e))?;
-
-    let bak_candidates = [
-        path.with_extension("exe.bak"),
-        path.with_extension("bak"),
-        path.with_extension("original"),
-    ];
-    let has_backup = bak_candidates.iter().any(|b| b.exists());
-    if !has_backup {
-        let bak = if path.extension().is_some_and(|ext| ext == "exe") {
-            path.with_extension("exe.bak")
-        } else {
-            path.with_extension("bak")
         };
-        let _ = fs::copy(path, &bak);
+        let start = usize::try_from(offset).map_err(|_| "Некорректное смещение секции")?;
+        let end = start
+            .checked_add(usize::try_from(size).map_err(|_| "Некорректная секция")?)
+            .ok_or("Переполнение секции")?;
+        let section_bytes = output
+            .get_mut(start..end)
+            .ok_or("Секция за пределами файла")?;
+        let (c, p) = apply_pattern(section_bytes, original, patched, fix)?;
+        changes += c;
+        existing += p;
     }
-
-    let mut applied_patches = Vec::new();
-
-    let re_x64_orig = regex_mgr_x64_orig();
-    let re_x64_patched = regex_mgr_x64_patched();
-    let x64_hits: Vec<usize> = re_x64_orig.find_iter(&data).map(|m| m.start()).collect();
-    if x64_hits.len() > 5 {
-        return Err("x64 Core: слишком много совпадений сигнатуры, отказ патчить".to_string());
-    }
-    if !x64_hits.is_empty() {
-        for start in x64_hits {
-            data[start..start + MGR_GATE_X64_FIX.len()].copy_from_slice(MGR_GATE_X64_FIX);
-        }
-        applied_patches.push("x64 Core 2.0 (hasValidAuth=true)");
-    } else if re_x64_patched.is_match(&data) {
-        applied_patches.push("x64 Core 2.0 (уже пропатчен)");
-    }
-
-    let re_arm_orig = regex_mgr_arm64_orig();
-    let re_arm_patched = regex_mgr_arm64_patched();
-    let arm_hits: Vec<usize> = re_arm_orig.find_iter(&data).map(|m| m.start()).collect();
-    if arm_hits.len() > 5 {
-        return Err("ARM64 Core: слишком много совпадений сигнатуры, отказ патчить".to_string());
-    }
-    if !arm_hits.is_empty() {
-        for start in arm_hits {
-            data[start..start + MGR_GATE_ARM64_FIX.len()].copy_from_slice(MGR_GATE_ARM64_FIX);
-        }
-        applied_patches.push("ARM64 Core 2.0 (hasValidAuth=true)");
-    } else if re_arm_patched.is_match(&data) {
-        applied_patches.push("ARM64 Core 2.0 (уже пропатчен)");
-    }
-
-    let re_cli_long_orig = regex_cli_x64_long_orig();
-    let re_cli_long_patched = regex_cli_x64_long_patched();
-    let cli_long_hits: Vec<usize> = re_cli_long_orig.find_iter(&data).map(|m| m.start()).collect();
-    if !cli_long_hits.is_empty() && cli_long_hits.len() <= 8 {
-        for start in cli_long_hits {
-            data[start..start + CLI_GATE_X64_LONG_FIX.len()].copy_from_slice(CLI_GATE_X64_LONG_FIX);
-        }
-        applied_patches.push("CLI Gate long (agy)");
-    } else if re_cli_long_patched.is_match(&data) {
-        applied_patches.push("CLI Gate long (уже пропатчен)");
-    }
-
-    let re_cli_orig = regex_cli_x64_orig();
-    let re_cli_patched = regex_cli_x64_patched();
-    let cli_hits: Vec<usize> = re_cli_orig.find_iter(&data).map(|m| m.start()).collect();
-    if cli_hits.len() > 8 {
-        // too generic — skip rather than corrupt the binary
-    } else if !cli_hits.is_empty() {
-        for start in cli_hits {
-            data[start..start + CLI_GATE_X64_FIX.len()].copy_from_slice(CLI_GATE_X64_FIX);
-        }
-        applied_patches.push("CLI Gate (agy)");
-    } else if re_cli_patched.is_match(&data) {
-        applied_patches.push("CLI Gate (уже пропатчен)");
-    }
-
-    if applied_patches.is_empty() {
-        let finder = memchr::memmem::Finder::new(STRING_FROM.as_bytes());
-        let to_bytes = STRING_TO.as_bytes();
-        let from_len = STRING_FROM.len();
-        let mut count = 0;
-        let mut pos = 0;
-        while let Some(idx) = finder.find(&data[pos..]) {
-            let abs_idx = pos + idx;
-            data[abs_idx..abs_idx + from_len].copy_from_slice(to_bytes);
-            count += 1;
-            pos = abs_idx + from_len;
-        }
-        if count > 0 {
-            applied_patches.push("Строковый fallback (ineligible -> inexigible)");
-        }
-    }
-
-    if applied_patches.is_empty() {
-        return Err("Патчи не применимы (неизвестная версия бинарника)".to_string());
-    }
-
-    robust_write_file(path, &data)?;
-    Ok(applied_patches.join(", "))
-}
-
-fn restore_binary_file(path: &Path) -> Result<String, String> {
-    let bak_candidates = [
-        path.with_extension("exe.bak"),
-        path.with_extension("bak"),
-        path.with_extension("original"),
-    ];
-
-    for bak in &bak_candidates {
-        if bak.exists() {
-            if let Ok(data) = fs::read(bak) {
-                if data.len() > 1000 {
-                    robust_write_file(path, &data)?;
-                    return Ok("Восстановлен из бэкапа (.bak)".to_string());
-                }
-            }
-        }
-    }
-
-    // Without .bak do not guess original jump offsets — only reverse the string swap.
-    let mut data = fs::read(path).map_err(|e| format!("Ошибка чтения {}: {}", path.display(), e))?;
-    let finder = memchr::memmem::Finder::new(STRING_TO.as_bytes());
-    let to_bytes = STRING_FROM.as_bytes();
-    let from_len = STRING_TO.len();
-    let mut count = 0;
-    let mut pos = 0;
-    while let Some(idx) = finder.find(&data[pos..]) {
-        let abs_idx = pos + idx;
-        data[abs_idx..abs_idx + from_len].copy_from_slice(to_bytes);
-        count += 1;
-        pos = abs_idx + from_len;
-    }
-    if count > 0 {
-        robust_write_file(path, &data)?;
-        return Ok(format!(
-            "Строковый откат без .bak (inexigible -> ineligible, {}). Опкоды не тронуты — нужен .bak",
-            count
+    if changes + existing != 1 {
+        return Err(format!(
+            "Версия не поддерживается профилем {profile}: совпадений {}. SHA-256 {}",
+            changes + existing,
+            journal::digest(data)
         ));
     }
+    Ok(Plan {
+        data: output,
+        changes,
+        existing,
+        profile: profile.into(),
+    })
+}
 
-    Ok("Нет .bak и нечего откатывать строками".to_string())
+fn plan(data: &[u8], kind: TargetKind) -> Result<Plan, String> {
+    match kind {
+        TargetKind::IdeMainJs => plan_js(data),
+        TargetKind::IdeAsar => crate::core::asar::plan_asar(data),
+        _ => plan_binary(data, kind),
+    }
+}
+fn inferred_kind(path: &Path) -> TargetKind {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if name.ends_with(".asar") {
+        TargetKind::IdeAsar
+    } else if name.ends_with(".js") {
+        TargetKind::IdeMainJs
+    } else if name == "agy" || name == "agy.exe" {
+        TargetKind::AgyCli
+    } else {
+        TargetKind::LanguageServer
+    }
+}
+pub fn check_binary_state(path: &Path) -> BinaryState {
+    state_for_kind(path, inferred_kind(path))
+}
+
+pub fn check_target_state(target: &FoundTarget) -> BinaryState {
+    state_for_kind(&target.path, target.kind)
+}
+
+fn state_for_kind(path: &Path, kind: TargetKind) -> BinaryState {
+    let Ok(data) = fs::read(path) else {
+        return BinaryState::Unknown;
+    };
+    match plan(&data, kind) {
+        Ok(p) => state_from_counts(p.changes, p.existing),
+        Err(_) => BinaryState::Unknown,
+    }
+}
+
+fn ensure_file_closed(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let holders = crate::system::file_lock::holders(&[path.to_path_buf()])?;
+        if !holders.is_empty() {
+            return Err(format!(
+                "Закройте Antigravity перед изменением файлов: {}",
+                holders.join(", ")
+            ));
+        }
+    }
+    let _ = path;
+    Ok(())
+}
+
+/// Signing is done on a temporary copy, before backup metadata and replacement.
+fn prepare_for_write(path: &Path, data: Vec<u8>, kind: TargetKind) -> Result<Vec<u8>, String> {
+    #[cfg(target_os = "macos")]
+    if matches!(kind, TargetKind::LanguageServer | TargetKind::AgyCli) {
+        use std::io::Write;
+        let mut temp =
+            tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(|e| e.to_string())?;
+        temp.write_all(&data).map_err(|e| e.to_string())?;
+        let status = std::process::Command::new("codesign")
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                "--preserve-metadata=entitlements,requirements,flags",
+            ])
+            .arg(temp.path())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !status.status.success() {
+            return Err(format!(
+                "Не удалось подписать временную копию; оригинал сохранён: {}",
+                String::from_utf8_lossy(&status.stderr).trim()
+            ));
+        }
+        let verified = std::process::Command::new("/usr/bin/codesign")
+            .args(["--verify", "--strict"])
+            .arg(temp.path())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !verified.status.success() {
+            return Err(format!(
+                "Подпись временной копии не прошла проверку: {}",
+                String::from_utf8_lossy(&verified.stderr).trim()
+            ));
+        }
+        return fs::read(temp.path()).map_err(|e| e.to_string());
+    }
+    let _ = (path, kind);
+    Ok(data)
+}
+
+pub fn patch_target(target: &FoundTarget) -> Result<PatchOutcome, String> {
+    let _guard = operation_guard();
+    let before = fs::read(&target.path).map_err(|e| e.to_string())?;
+    let p = plan(&before, target.kind)?;
+    if p.changes == 0 {
+        return if p.existing > 0 {
+            Ok(PatchOutcome::AlreadyPatched)
+        } else if matches!(target.kind, TargetKind::IdeAsar) {
+            Ok(PatchOutcome::NotApplicable)
+        } else {
+            Err("Версия/сигнатура не поддерживается; файл не изменён".into())
+        };
+    }
+    ensure_file_closed(&target.path)?;
+    let after = prepare_for_write(&target.path, p.data, target.kind)?;
+    journal::apply(&target.path, Some(&before), &after, &p.profile)?;
+    Ok(PatchOutcome::Changed(p.changes))
+}
+
+pub fn restore_target(target: &FoundTarget) -> Result<PatchOutcome, String> {
+    let _guard = operation_guard();
+    ensure_file_closed(&target.path)?;
+    if journal::restore(&target.path)? {
+        return Ok(PatchOutcome::Restored);
+    }
+    let before = fs::read(&target.path).map_err(|e| e.to_string())?;
+    if matches!(target.kind, TargetKind::IdeAsar | TargetKind::IdeMainJs)
+        && plan(&before, target.kind).is_ok_and(|p| p.changes == 0 && p.existing == 0)
+    {
+        return Ok(PatchOutcome::NotApplicable);
+    }
+    let current_state = plan(&before, target.kind)
+        .map(|p| state_from_counts(p.changes, p.existing))
+        .unwrap_or(BinaryState::Unknown);
+    if current_state == BinaryState::Stock {
+        return Ok(PatchOutcome::AlreadyStock);
+    }
+    // Legacy backups are accepted only if applying this exact engine reproduces the current bytes.
+    let mut candidates = vec![
+        target.path.with_extension("bak"),
+        target.path.with_extension("original"),
+    ];
+    let mut appended = target.path.as_os_str().to_os_string();
+    appended.push(".bak");
+    candidates.push(appended.into());
+    for backup in candidates {
+        if let Ok(original) = fs::read(&backup) {
+            if let Ok(p) = plan(&original, target.kind) {
+                if p.changes > 0 && p.existing == 0 && p.data == before {
+                    crate::system::fs_utils::robust_write_file(&target.path, &original)?;
+                    return Ok(PatchOutcome::Restored);
+                }
+            }
+        }
+    }
+    Err("Нет backup, соответствующего текущей версии. Файл сохранён; восстановите точную версию приложения.".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unrelated_valid_asar_is_skipped_but_damaged_archive_is_not_called_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = FoundTarget {
+            path: dir.path().join("app.asar"),
+            kind: TargetKind::IdeAsar,
+            name: "fixture".into(),
+        };
+        let header = b"{\"files\":{}}";
+        let mut bytes = vec![];
+        for value in [4u32, 20, 16, header.len() as u32] {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes.extend(header);
+        bytes.resize(28, 0);
+        fs::write(&target.path, &bytes).unwrap();
+        assert_eq!(patch_target(&target).unwrap(), PatchOutcome::NotApplicable);
+        assert_eq!(
+            restore_target(&target).unwrap(),
+            PatchOutcome::NotApplicable
+        );
+        assert_eq!(fs::read(&target.path).unwrap(), bytes);
+        fs::write(&target.path, b"broken archive").unwrap();
+        assert!(restore_target(&target).is_err());
+    }
+    fn macho_fixture(code: &[u8], cpu: u32) -> Vec<u8> {
+        let mut data = vec![0u8; 1024];
+        // mach_header_64 + LC_SEGMENT_64 + one executable __text section.
+        for (offset, value) in [
+            (0, 0xfeedfacfu32),
+            (4, cpu),
+            (12, 2),
+            (16, 1),
+            (20, 152),
+            (32, 0x19),
+            (36, 152),
+            (88, 7),
+            (92, 5),
+            (96, 1),
+            (152, 512),
+            (156, 2),
+            (168, 0x80000400),
+        ] {
+            data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (offset, value) in [(64, 1024u64), (80, 1024), (144, code.len() as u64)] {
+            data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        data[40..46].copy_from_slice(b"__TEXT");
+        data[104..110].copy_from_slice(b"__text");
+        data[120..126].copy_from_slice(b"__TEXT");
+        data[512..512 + code.len()].copy_from_slice(code);
+        data
+    }
+
+    #[test]
+    fn macho_core_profiles_support_both_architectures_and_reject_unknown_cli() {
+        let x64 = b"\x80\x78\x08\x00\x74\x0a\x48\x8b\x44\x24\x20\x48\x89\x44\x60";
+        let arm64 = b"\x03\x20\x40\x39\x03\x00\x00\x36\x00\x00\x00\x00\x03\x10\x06\xa9";
+        for (code, cpu) in [(x64.as_slice(), 0x01000007), (arm64.as_slice(), 0x0100000c)] {
+            let original = macho_fixture(code, cpu);
+            let patched = plan_binary(&original, TargetKind::LanguageServer).unwrap();
+            assert_eq!((patched.changes, patched.existing), (1, 0));
+            assert_eq!(&patched.data[..512], &original[..512]);
+            let repeated = plan_binary(&patched.data, TargetKind::LanguageServer).unwrap();
+            assert_eq!((repeated.changes, repeated.existing), (0, 1));
+            assert_eq!(repeated.data, patched.data);
+        }
+        assert!(plan_binary(&macho_fixture(arm64, 0x0100000c), TargetKind::AgyCli).is_err());
+        let cli = b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85";
+        assert_eq!(
+            plan_binary(&macho_fixture(cli, 0x01000007), TargetKind::AgyCli)
+                .unwrap()
+                .changes,
+            1
+        );
+    }
+
+    fn pe_fixture(code: &[u8], machine: u16) -> Vec<u8> {
+        let mut data = vec![0u8; 1536];
+        data[..2].copy_from_slice(b"MZ");
+        data[60..64].copy_from_slice(&128u32.to_le_bytes());
+        data[128..132].copy_from_slice(b"PE\0\0");
+        for (offset, value) in [
+            (132, machine),
+            (134, 2),
+            (148, 240),
+            (150, 0x22),
+            (152, 0x20b),
+            (220, 3),
+        ] {
+            data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        for (offset, value) in [
+            (156, 512u32),
+            (168, 0x1000),
+            (172, 0x1000),
+            (184, 0x1000),
+            (188, 512),
+            (208, 0x3000),
+            (212, 512),
+            (260, 16),
+        ] {
+            data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (section, name, raw, address, flags) in [
+            (392, b".text\0\0\0", 512u32, 0x1000u32, 0x60000020u32),
+            (432, b".rdata\0\0", 1024, 0x2000, 0x40000040),
+        ] {
+            data[section..section + 8].copy_from_slice(name);
+            for (offset, value) in [(8, 512), (12, address), (16, 512), (20, raw), (36, flags)] {
+                data[section + offset..section + offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            data[raw as usize..raw as usize + code.len()].copy_from_slice(code);
+        }
+        data
+    }
+    #[test]
+    fn pe_architecture_code_sections_and_exact_rollback() {
+        let code = b"\x80\x78\x08\x00\x74\x0a\x48\x8b\x44\x24\x20\x48\x89\x44\x60";
+        let original = pe_fixture(code, 0x8664);
+        let p = plan_binary(&original, TargetKind::LanguageServer).unwrap();
+        assert_eq!((p.changes, p.existing), (1, 0));
+        assert_eq!(&p.data[1024..], &original[1024..]); // Identical marker in data is untouched.
+        assert!(plan_binary(&pe_fixture(code, 0xaa64), TargetKind::LanguageServer).is_err());
+        assert!(plan_binary(
+            &pe_fixture(&[code.as_slice(), code.as_slice()].concat(), 0x8664),
+            TargetKind::LanguageServer
+        )
+        .is_err());
+        // Synthetic PE can be used for planner tests on every platform. A JS
+        // target exercises filesystem transactions without invoking macOS signing.
+        let dir = tempfile::tempdir().unwrap();
+        let target = FoundTarget {
+            path: dir.path().join("main.js"),
+            kind: TargetKind::IdeMainJs,
+            name: "fixture".into(),
+        };
+        let original = b"x.resetIsTierGCPTos(),x.isGoogleInternal;";
+        fs::write(&target.path, original).unwrap();
+        assert_eq!(patch_target(&target).unwrap(), PatchOutcome::Changed(1));
+        assert_eq!(patch_target(&target).unwrap(), PatchOutcome::AlreadyPatched);
+        assert_eq!(restore_target(&target).unwrap(), PatchOutcome::Restored);
+        assert_eq!(fs::read(&target.path).unwrap(), original);
+        assert_eq!(restore_target(&target).unwrap(), PatchOutcome::AlreadyStock);
+    }
+    #[test]
+    fn binary_wildcards_match_linefeed_but_ambiguous_gates_are_rejected() {
+        let bytes = b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85";
+        assert!(regex_cli_x64_long_orig().is_match(bytes));
+        let mut duplicate = [bytes.as_slice(), bytes.as_slice()].concat();
+        assert!(apply_pattern(
+            &mut duplicate,
+            regex_cli_x64_long_orig(),
+            regex_cli_x64_long_patched(),
+            CLI_GATE_X64_LONG_FIX
+        )
+        .is_err());
+    }
+    #[test]
+    fn partial_js_is_completed_and_unrelated_text_is_unsupported() {
+        let p = plan_js(b"x.resetIsTierGCPTos(),true; y.resetIsTierGCPTos(),y.isGoogleInternal")
+            .unwrap();
+        assert_eq!(
+            state_from_counts(p.changes, p.existing),
+            BinaryState::PartiallyPatched
+        );
+        let next = plan_js(&p.data).unwrap();
+        assert_eq!((next.changes, next.existing), (0, 2));
+        assert_eq!(plan_js(b"object.isGoogleInternal").unwrap().changes, 0);
+    }
+    #[test]
+    fn raw_bytes_and_generic_cli_gate_do_not_authorize_a_binary_patch() {
+        assert!(plan_binary(
+            b"\x48\x85\xc0\x74\x0a\x48\x8b ineligible",
+            TargetKind::AgyCli
+        )
+        .is_err());
+    }
 }

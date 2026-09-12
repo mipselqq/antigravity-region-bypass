@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
-#[allow(unused_imports)]
-use std::process::Command;
 use crate::net::provider::NRPT_TAG;
 #[allow(unused_imports)]
 use crate::system::process::no_window;
+#[allow(unused_imports)]
+use std::process::Command;
 
 pub fn get_nrpt_status_info() -> (usize, Option<String>, bool) {
     #[cfg(target_os = "windows")]
@@ -46,9 +46,12 @@ pub fn get_nrpt_status_info() -> (usize, Option<String>, bool) {
             fn RegCloseKey(hKey: usize) -> i32;
         }
 
-        let subkey = wide_str(r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig");
+        let subkey =
+            wide_str(r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig");
         let mut hkey: usize = 0;
-        if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
+        if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) }
+            != 0
+        {
             return (0, None, false);
         }
 
@@ -87,7 +90,16 @@ pub fn get_nrpt_status_info() -> (usize, Option<String>, bool) {
             ));
 
             let mut hrule: usize = 0;
-            if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, rule_subkey.as_ptr(), 0, KEY_READ, &mut hrule) } == 0 {
+            if unsafe {
+                RegOpenKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    rule_subkey.as_ptr(),
+                    0,
+                    KEY_READ,
+                    &mut hrule,
+                )
+            } == 0
+            {
                 let mut comment = String::new();
                 let mut display_name = String::new();
 
@@ -102,7 +114,8 @@ pub fn get_nrpt_status_info() -> (usize, Option<String>, bool) {
                         data.as_mut_ptr(),
                         &mut data_len,
                     )
-                } == 0 {
+                } == 0
+                {
                     comment = parse_wide_string(&data, data_len);
                 }
 
@@ -117,7 +130,8 @@ pub fn get_nrpt_status_info() -> (usize, Option<String>, bool) {
                         disp_data.as_mut_ptr(),
                         &mut disp_len,
                     )
-                } == 0 {
+                } == 0
+                {
                     display_name = parse_wide_string(&disp_data, disp_len);
                 }
 
@@ -139,7 +153,8 @@ pub fn get_nrpt_status_info() -> (usize, Option<String>, bool) {
                                 ip_data.as_mut_ptr(),
                                 &mut ip_len,
                             )
-                        } == 0 {
+                        } == 0
+                        {
                             found_ip = true;
                         } else {
                             ip_len = ip_data.len() as u32;
@@ -152,7 +167,8 @@ pub fn get_nrpt_status_info() -> (usize, Option<String>, bool) {
                                     ip_data.as_mut_ptr(),
                                     &mut ip_len,
                                 )
-                            } == 0 {
+                            } == 0
+                            {
                                 found_ip = true;
                             }
                         }
@@ -191,7 +207,11 @@ pub fn get_nrpt_status_info() -> (usize, Option<String>, bool) {
                             if ns.is_none() {
                                 for line in c.lines() {
                                     if line.starts_with("nameserver ") {
-                                        ns = Some(line.trim_start_matches("nameserver ").trim().to_string());
+                                        ns = Some(
+                                            line.trim_start_matches("nameserver ")
+                                                .trim()
+                                                .to_string(),
+                                        );
                                     }
                                 }
                             }
@@ -212,21 +232,29 @@ pub fn get_nrpt_status_info() -> (usize, Option<String>, bool) {
 fn wide_str(s: &str) -> Vec<u16> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 #[cfg(target_os = "windows")]
 fn parse_wide_string(bytes: &[u8], len: u32) -> String {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
-    let u16_len = (len as usize) / 2;
-    let slice: &[u16] = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, u16_len) };
+    let u16_len = (len as usize).min(bytes.len()) / 2;
+    let slice: Vec<u16> = bytes[..u16_len * 2]
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
     let trim_len = slice.iter().position(|&c| c == 0).unwrap_or(u16_len);
-    OsString::from_wide(&slice[..trim_len]).to_string_lossy().to_string()
+    OsString::from_wide(&slice[..trim_len])
+        .to_string_lossy()
+        .to_string()
 }
 
 #[cfg(target_os = "windows")]
-pub fn native_remove_nrpt_rules() -> usize {
+pub fn native_remove_nrpt_rules() -> Result<usize, String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use std::ptr::null_mut;
@@ -237,17 +265,51 @@ pub fn native_remove_nrpt_rules() -> usize {
 
     #[link(name = "advapi32")]
     extern "system" {
-        fn RegOpenKeyExW(hKey: usize, lpSubKey: *const u16, ulOptions: u32, samDesired: u32, phkResult: *mut usize) -> i32;
-        fn RegEnumKeyExW(hKey: usize, dwIndex: u32, lpName: *mut u16, lpcchName: *mut u32, lpReserved: *mut u32, lpClass: *mut u16, lpcchClass: *mut u32, lpftLastWriteTime: *mut u64) -> i32;
-        fn RegQueryValueExW(hKey: usize, lpValueName: *const u16, lpReserved: *mut u32, lpType: *mut u32, lpData: *mut u8, lpcbData: *mut u32) -> i32;
+        fn RegOpenKeyExW(
+            hKey: usize,
+            lpSubKey: *const u16,
+            ulOptions: u32,
+            samDesired: u32,
+            phkResult: *mut usize,
+        ) -> i32;
+        fn RegEnumKeyExW(
+            hKey: usize,
+            dwIndex: u32,
+            lpName: *mut u16,
+            lpcchName: *mut u32,
+            lpReserved: *mut u32,
+            lpClass: *mut u16,
+            lpcchClass: *mut u32,
+            lpftLastWriteTime: *mut u64,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hKey: usize,
+            lpValueName: *const u16,
+            lpReserved: *mut u32,
+            lpType: *mut u32,
+            lpData: *mut u8,
+            lpcbData: *mut u32,
+        ) -> i32;
         fn RegDeleteKeyW(hKey: usize, lpSubKey: *const u16) -> i32;
         fn RegCloseKey(hKey: usize) -> i32;
     }
 
     let subkey = wide_str(r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig");
     let mut hkey: usize = 0;
-    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ | KEY_WRITE, &mut hkey) } != 0 {
-        return 0;
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            0,
+            KEY_READ | KEY_WRITE,
+            &mut hkey,
+        )
+    };
+    if opened == 2 {
+        return Ok(0);
+    }
+    if opened != 0 {
+        return Err(format!("NRPT open: {opened}"));
     }
 
     let comment_val = wide_str("Comment");
@@ -270,8 +332,12 @@ pub fn native_remove_nrpt_rules() -> usize {
                 null_mut(),
             )
         };
-        if ret != 0 {
+        if ret == 259 {
             break;
+        }
+        if ret != 0 {
+            unsafe { RegCloseKey(hkey) };
+            return Err(format!("NRPT enumeration: {ret}"));
         }
         idx += 1;
 
@@ -282,19 +348,48 @@ pub fn native_remove_nrpt_rules() -> usize {
         ));
 
         let mut hrule: usize = 0;
-        if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, rule_subkey.as_ptr(), 0, KEY_READ, &mut hrule) } == 0 {
+        if unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                rule_subkey.as_ptr(),
+                0,
+                KEY_READ,
+                &mut hrule,
+            )
+        } == 0
+        {
             let mut comment = String::new();
             let mut display_name = String::new();
 
             let mut data = [0u8; 512];
             let mut data_len = data.len() as u32;
-            if unsafe { RegQueryValueExW(hrule, comment_val.as_ptr(), null_mut(), null_mut(), data.as_mut_ptr(), &mut data_len) } == 0 {
+            if unsafe {
+                RegQueryValueExW(
+                    hrule,
+                    comment_val.as_ptr(),
+                    null_mut(),
+                    null_mut(),
+                    data.as_mut_ptr(),
+                    &mut data_len,
+                )
+            } == 0
+            {
                 comment = parse_wide_string(&data, data_len);
             }
 
             let mut disp_data = [0u8; 512];
             let mut disp_len = disp_data.len() as u32;
-            if unsafe { RegQueryValueExW(hrule, display_val.as_ptr(), null_mut(), null_mut(), disp_data.as_mut_ptr(), &mut disp_len) } == 0 {
+            if unsafe {
+                RegQueryValueExW(
+                    hrule,
+                    display_val.as_ptr(),
+                    null_mut(),
+                    null_mut(),
+                    disp_data.as_mut_ptr(),
+                    &mut disp_len,
+                )
+            } == 0
+            {
                 display_name = parse_wide_string(&disp_data, disp_len);
             }
 
@@ -309,6 +404,9 @@ pub fn native_remove_nrpt_rules() -> usize {
             }
 
             unsafe { RegCloseKey(hrule) };
+        } else {
+            unsafe { RegCloseKey(hkey) };
+            return Err("Не прочитано правило NRPT; откат не подтверждён".into());
         }
     }
 
@@ -316,13 +414,17 @@ pub fn native_remove_nrpt_rules() -> usize {
     for key_name in keys_to_delete {
         let mut key_wide = key_name;
         key_wide.push(0);
-        if unsafe { RegDeleteKeyW(hkey, key_wide.as_ptr()) } == 0 {
+        let status = unsafe { RegDeleteKeyW(hkey, key_wide.as_ptr()) };
+        if status == 0 {
             deleted += 1;
+        } else if status != 2 {
+            unsafe { RegCloseKey(hkey) };
+            return Err(format!("NRPT delete: {status}"));
         }
     }
 
     unsafe { RegCloseKey(hkey) };
-    deleted
+    Ok(deleted)
 }
 
 #[cfg(target_os = "windows")]
@@ -337,7 +439,11 @@ fn multi_sz_str(s: &str) -> Vec<u16> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn apply_nrpt_rules_direct(rules: &[(String, String)], tag: &str, display_prefix: &str) -> usize {
+pub fn apply_nrpt_rules_direct(
+    rules: &[(String, String)],
+    tag: &str,
+    display_prefix: &str,
+) -> usize {
     use std::ptr::null_mut;
 
     const HKEY_LOCAL_MACHINE: usize = 0x80000002u32 as i32 as isize as usize;
@@ -402,17 +508,69 @@ pub fn apply_nrpt_rules_direct(rules: &[(String, String)], tag: &str, display_pr
             let disp_name = format!("{} ({})", display_prefix, domain);
             let disp_wide = wide_str(&disp_name);
 
+            let mut written = true;
             unsafe {
-                RegSetValueExW(hrule, wide_str("Version").as_ptr(), 0, REG_DWORD, &version_val as *const _ as *const u8, 4);
-                RegSetValueExW(hrule, wide_str("Name").as_ptr(), 0, REG_MULTI_SZ, ns_multi.as_ptr() as *const u8, (ns_multi.len() * 2) as u32);
-                RegSetValueExW(hrule, wide_str("GenericDNSServers").as_ptr(), 0, REG_SZ, servers_wide.as_ptr() as *const u8, (servers_wide.len() * 2) as u32);
-                RegSetValueExW(hrule, wide_str("Comment").as_ptr(), 0, REG_SZ, comment_wide.as_ptr() as *const u8, (comment_wide.len() * 2) as u32);
-                RegSetValueExW(hrule, wide_str("DisplayName").as_ptr(), 0, REG_SZ, disp_wide.as_ptr() as *const u8, (disp_wide.len() * 2) as u32);
-                RegSetValueExW(hrule, wide_str("IPSECCARestriction").as_ptr(), 0, REG_SZ, empty_wide.as_ptr() as *const u8, (empty_wide.len() * 2) as u32);
-                RegSetValueExW(hrule, wide_str("ConfigOptions").as_ptr(), 0, REG_DWORD, &config_options as *const _ as *const u8, 4);
+                written &= RegSetValueExW(
+                    hrule,
+                    wide_str("Version").as_ptr(),
+                    0,
+                    REG_DWORD,
+                    &version_val as *const _ as *const u8,
+                    4,
+                ) == 0;
+                written &= RegSetValueExW(
+                    hrule,
+                    wide_str("Name").as_ptr(),
+                    0,
+                    REG_MULTI_SZ,
+                    ns_multi.as_ptr() as *const u8,
+                    (ns_multi.len() * 2) as u32,
+                ) == 0;
+                written &= RegSetValueExW(
+                    hrule,
+                    wide_str("GenericDNSServers").as_ptr(),
+                    0,
+                    REG_SZ,
+                    servers_wide.as_ptr() as *const u8,
+                    (servers_wide.len() * 2) as u32,
+                ) == 0;
+                written &= RegSetValueExW(
+                    hrule,
+                    wide_str("Comment").as_ptr(),
+                    0,
+                    REG_SZ,
+                    comment_wide.as_ptr() as *const u8,
+                    (comment_wide.len() * 2) as u32,
+                ) == 0;
+                written &= RegSetValueExW(
+                    hrule,
+                    wide_str("DisplayName").as_ptr(),
+                    0,
+                    REG_SZ,
+                    disp_wide.as_ptr() as *const u8,
+                    (disp_wide.len() * 2) as u32,
+                ) == 0;
+                written &= RegSetValueExW(
+                    hrule,
+                    wide_str("IPSECCARestriction").as_ptr(),
+                    0,
+                    REG_SZ,
+                    empty_wide.as_ptr() as *const u8,
+                    (empty_wide.len() * 2) as u32,
+                ) == 0;
+                written &= RegSetValueExW(
+                    hrule,
+                    wide_str("ConfigOptions").as_ptr(),
+                    0,
+                    REG_DWORD,
+                    &config_options as *const _ as *const u8,
+                    4,
+                ) == 0;
                 RegCloseKey(hrule);
             }
-            count += 1;
+            if written {
+                count += 1;
+            }
         }
     }
 
@@ -420,24 +578,34 @@ pub fn apply_nrpt_rules_direct(rules: &[(String, String)], tag: &str, display_pr
 }
 
 fn norm_ns(s: &str) -> String {
-    s.trim().trim_start_matches('.').trim_end_matches('.').to_lowercase()
+    s.trim()
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_lowercase()
 }
 
 #[cfg(target_os = "windows")]
 fn parse_multi_sz(bytes: &[u8], len: u32) -> Vec<String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
-    let u16_len = (len as usize) / 2;
+    let u16_len = (len as usize).min(bytes.len()) / 2;
     if u16_len == 0 {
         return Vec::new();
     }
-    let slice: &[u16] = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, u16_len) };
+    let slice: Vec<u16> = bytes[..u16_len * 2]
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
     let mut out = Vec::new();
     let mut start = 0usize;
     for i in 0..u16_len {
         if slice[i] == 0 {
             if i > start {
-                out.push(OsString::from_wide(&slice[start..i]).to_string_lossy().to_string());
+                out.push(
+                    OsString::from_wide(&slice[start..i])
+                        .to_string_lossy()
+                        .to_string(),
+                );
                 start = i + 1;
             } else {
                 break;
@@ -447,7 +615,7 @@ fn parse_multi_sz(bytes: &[u8], len: u32) -> Vec<String> {
     out
 }
 
-pub fn take_over_conflicting_rules(namespaces: &[&str]) -> Vec<String> {
+pub fn conflicting_rules(namespaces: &[&str]) -> Result<Vec<String>, String> {
     #[cfg(target_os = "windows")]
     {
         use std::ffi::OsString;
@@ -460,34 +628,75 @@ pub fn take_over_conflicting_rules(namespaces: &[&str]) -> Vec<String> {
 
         #[link(name = "advapi32")]
         extern "system" {
-            fn RegOpenKeyExW(hKey: usize, lpSubKey: *const u16, ulOptions: u32, samDesired: u32, phkResult: *mut usize) -> i32;
-            fn RegEnumKeyExW(hKey: usize, dwIndex: u32, lpName: *mut u16, lpcchName: *mut u32, lpReserved: *mut u32, lpClass: *mut u16, lpcchClass: *mut u32, lpftLastWriteTime: *mut u64) -> i32;
-            fn RegQueryValueExW(hKey: usize, lpValueName: *const u16, lpReserved: *mut u32, lpType: *mut u32, lpData: *mut u8, lpcbData: *mut u32) -> i32;
+            fn RegOpenKeyExW(
+                hKey: usize,
+                lpSubKey: *const u16,
+                ulOptions: u32,
+                samDesired: u32,
+                phkResult: *mut usize,
+            ) -> i32;
+            fn RegEnumKeyExW(
+                hKey: usize,
+                dwIndex: u32,
+                lpName: *mut u16,
+                lpcchName: *mut u32,
+                lpReserved: *mut u32,
+                lpClass: *mut u16,
+                lpcchClass: *mut u32,
+                lpftLastWriteTime: *mut u64,
+            ) -> i32;
+            fn RegQueryValueExW(
+                hKey: usize,
+                lpValueName: *const u16,
+                lpReserved: *mut u32,
+                lpType: *mut u32,
+                lpData: *mut u8,
+                lpcbData: *mut u32,
+            ) -> i32;
             fn RegDeleteKeyW(hKey: usize, lpSubKey: *const u16) -> i32;
             fn RegCloseKey(hKey: usize) -> i32;
         }
 
         let ours: Vec<String> = namespaces.iter().map(|s| norm_ns(s)).collect();
-        let subkey = wide_str(r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig");
+        let subkey =
+            wide_str(r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig");
         let mut hkey: usize = 0;
-        if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ | KEY_WRITE, &mut hkey) } != 0 {
-            return Vec::new();
+        let opened =
+            unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
+        if opened == 2 {
+            return Ok(Vec::new());
+        }
+        if opened != 0 {
+            return Err(format!("NRPT conflict query: {opened}"));
         }
 
         let comment_val = wide_str("Comment");
         let display_val = wide_str("DisplayName");
         let name_val = wide_str("Name");
-        let mut keys_to_delete: Vec<(Vec<u16>, String)> = Vec::new();
+        let mut conflicts: Vec<(Vec<u16>, String)> = Vec::new();
         let mut idx = 0u32;
 
         loop {
             let mut name_buf = [0u16; 256];
             let mut name_len = name_buf.len() as u32;
             let ret = unsafe {
-                RegEnumKeyExW(hkey, idx, name_buf.as_mut_ptr(), &mut name_len, null_mut(), null_mut(), null_mut(), null_mut())
+                RegEnumKeyExW(
+                    hkey,
+                    idx,
+                    name_buf.as_mut_ptr(),
+                    &mut name_len,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                )
             };
-            if ret != 0 {
+            if ret == 259 {
                 break;
+            }
+            if ret != 0 {
+                unsafe { RegCloseKey(hkey) };
+                return Err(format!("NRPT conflict enumeration: {ret}"));
             }
             idx += 1;
 
@@ -498,20 +707,50 @@ pub fn take_over_conflicting_rules(namespaces: &[&str]) -> Vec<String> {
                 key_str
             ));
             let mut hrule: usize = 0;
-            if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, rule_subkey.as_ptr(), 0, KEY_READ, &mut hrule) } != 0 {
-                continue;
+            if unsafe {
+                RegOpenKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    rule_subkey.as_ptr(),
+                    0,
+                    KEY_READ,
+                    &mut hrule,
+                )
+            } != 0
+            {
+                unsafe { RegCloseKey(hkey) };
+                return Err("Не прочитано правило NRPT".into());
             }
 
             let mut comment = String::new();
             let mut display_name = String::new();
             let mut data = [0u8; 512];
             let mut data_len = data.len() as u32;
-            if unsafe { RegQueryValueExW(hrule, comment_val.as_ptr(), null_mut(), null_mut(), data.as_mut_ptr(), &mut data_len) } == 0 {
+            if unsafe {
+                RegQueryValueExW(
+                    hrule,
+                    comment_val.as_ptr(),
+                    null_mut(),
+                    null_mut(),
+                    data.as_mut_ptr(),
+                    &mut data_len,
+                )
+            } == 0
+            {
                 comment = parse_wide_string(&data, data_len);
             }
             let mut disp_data = [0u8; 512];
             let mut disp_len = disp_data.len() as u32;
-            if unsafe { RegQueryValueExW(hrule, display_val.as_ptr(), null_mut(), null_mut(), disp_data.as_mut_ptr(), &mut disp_len) } == 0 {
+            if unsafe {
+                RegQueryValueExW(
+                    hrule,
+                    display_val.as_ptr(),
+                    null_mut(),
+                    null_mut(),
+                    disp_data.as_mut_ptr(),
+                    &mut disp_len,
+                )
+            } == 0
+            {
                 display_name = parse_wide_string(&disp_data, disp_len);
             }
 
@@ -522,7 +761,17 @@ pub fn take_over_conflicting_rules(namespaces: &[&str]) -> Vec<String> {
             if !is_ours {
                 let mut ns_data = [0u8; 2048];
                 let mut ns_len = ns_data.len() as u32;
-                if unsafe { RegQueryValueExW(hrule, name_val.as_ptr(), null_mut(), null_mut(), ns_data.as_mut_ptr(), &mut ns_len) } == 0 {
+                if unsafe {
+                    RegQueryValueExW(
+                        hrule,
+                        name_val.as_ptr(),
+                        null_mut(),
+                        null_mut(),
+                        ns_data.as_mut_ptr(),
+                        &mut ns_len,
+                    )
+                } == 0
+                {
                     let names = parse_multi_sz(&ns_data, ns_len);
                     let overlap = names.iter().any(|n| {
                         let nn = norm_ns(n);
@@ -531,26 +780,135 @@ pub fn take_over_conflicting_rules(namespaces: &[&str]) -> Vec<String> {
                     if overlap {
                         let mut key_wide = name_buf[..name_len as usize].to_vec();
                         key_wide.push(0);
-                        keys_to_delete.push((key_wide, key_str.clone()));
+                        conflicts.push((key_wide, key_str.clone()));
                     }
                 }
             }
             unsafe { RegCloseKey(hrule) };
         }
 
-        let mut removed = Vec::new();
-        for (key_wide, key_str) in keys_to_delete {
-            if unsafe { RegDeleteKeyW(hkey, key_wide.as_ptr()) } == 0 {
-                removed.push(key_str);
-            }
+        let mut found = Vec::new();
+        for (_, key_str) in conflicts {
+            found.push(key_str);
         }
         unsafe { RegCloseKey(hkey) };
-        removed
+        Ok(found)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         let _ = namespaces;
-        Vec::new()
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn effective_check_script(rules: &[(String, String)]) -> Result<String, String> {
+    let expected: Vec<_> = rules
+        .iter()
+        .map(|(namespace, servers)| serde_json::json!({"Namespace": namespace, "Servers": servers}))
+        .collect();
+    let json = serde_json::to_string(&expected)
+        .map_err(|e| e.to_string())?
+        .replace("'", "''");
+    Ok(format!(
+        r#"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$ErrorActionPreference = 'Stop'
+try {{
+    function Normalize-NrptServers([object[]]$items) {{
+        @($(foreach($item in $items) {{
+            foreach($part in (([string]$item) -split '[;,]')) {{
+                $part = $part.Trim()
+                if($part) {{ ([System.Net.IPAddress]::Parse($part)).ToString() }}
+            }}
+        }}) | Sort-Object -Unique)
+    }}
+    $expected = ConvertFrom-Json -InputObject '{json}'
+    $actual = @(Get-DnsClientNrptPolicy -Effective -ErrorAction Stop)
+    foreach($rule in $expected) {{
+        $matching = @($actual | Where-Object {{ @($_.Namespace) -contains $rule.Namespace }})
+        if($matching.Count -ne 1) {{ throw ('NRPT effective conflict/missing: ' + $rule.Namespace) }}
+        $wanted = @(Normalize-NrptServers @($rule.Servers))
+        $found = @(Normalize-NrptServers @($matching[0].NameServers))
+        if(($wanted -join ';') -ne ($found -join ';')) {{ throw ('NRPT overridden: ' + $rule.Namespace) }}
+    }}
+}} catch {{
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}}
+"#
+    ))
+}
+
+#[cfg(target_os = "windows")]
+pub fn verify_effective(rules: &[(String, String)]) -> Result<(), String> {
+    let script = effective_check_script(rules)?;
+    let out = no_window(&mut Command::new("powershell.exe"))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "Эффективная NRPT не подтверждена: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    #[test]
+    fn effective_policy_accepts_ip_objects_and_strings_but_rejects_override() {
+        let expected = vec![("example.test".into(), "127.0.0.53;::1".into())];
+        let check = effective_check_script(&expected).unwrap();
+        for (servers, success) in [
+            ("@([System.Net.IPAddress]::Parse('::1'), [System.Net.IPAddress]::Parse('127.0.0.53'))", true),
+            ("@('127.0.0.53;0:0:0:0:0:0:0:1')", true),
+            ("@('::1', '8.8.8.8')", false),
+            ("@()", false),
+        ] {
+            let fixture = format!("function Get-DnsClientNrptPolicy {{ [pscustomobject]@{{ Namespace=@('example.test'); NameServers={servers} }} }}\n{check}");
+            let out = no_window(&mut Command::new("powershell.exe")).args(["-NoProfile", "-NonInteractive", "-Command", &fixture]).output().unwrap();
+            assert_eq!(out.status.success(), success, "{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+    #[test]
+    fn effective_policy_checks_each_rule_in_a_multi_rule_json_array() {
+        let check = effective_check_script(&[
+            ("one.test".into(), "127.0.0.53".into()),
+            ("two.test".into(), "127.0.0.53".into()),
+        ])
+        .unwrap();
+        for (second, success) in [("127.0.0.53", true), ("8.8.8.8", false)] {
+            let script = format!("function Get-DnsClientNrptPolicy {{ [pscustomobject]@{{Namespace=@('one.test');NameServers=[System.Net.IPAddress]::Parse('127.0.0.53')}}; [pscustomobject]@{{Namespace=@('two.test');NameServers='{second}'}} }}\n{check}");
+            let out = no_window(&mut Command::new("powershell.exe"))
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.success(),
+                success,
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    #[test]
+    fn effective_policy_error_is_utf8_and_missing_rule_fails() {
+        let check =
+            effective_check_script(&[("example.test".into(), "127.0.0.53".into())]).unwrap();
+        for body in ["throw 'Ошибка проверки сети'", "return @()"] {
+            let script = format!("function Get-DnsClientNrptPolicy {{ {body} }}\n{check}");
+            let out = no_window(&mut Command::new("powershell.exe"))
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+                .unwrap();
+            assert!(!out.status.success());
+            let error = String::from_utf8(out.stderr).unwrap();
+            assert!(error.contains("Ошибка проверки сети") || error.contains("conflict/missing"));
+        }
     }
 }

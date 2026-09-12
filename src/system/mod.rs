@@ -1,5 +1,7 @@
 pub mod env;
+pub mod file_lock;
 pub mod fs_utils;
+pub mod journal;
 pub mod lock;
 pub mod privilege;
 pub mod process;

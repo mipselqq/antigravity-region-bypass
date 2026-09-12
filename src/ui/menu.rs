@@ -1,508 +1,372 @@
-use std::path::Path;
-use crate::core::asar::read_asar_package_version;
-use crate::core::detector::{find_asar_in_path, find_installations, find_targets_in_path, FoundTarget};
-use crate::core::patcher::{check_binary_state, patch_target, restore_target, BinaryState};
+use crate::core::detector::{find_installations, find_targets_in_path, FoundTarget};
+use crate::core::patcher::{patch_target, restore_target};
 use crate::core::v8_cache::clear_ide_v8_caches;
-use crate::net::nrpt::get_nrpt_status_info;
 use crate::net::{apply_dns_rules, remove_dns_rules};
 use crate::system::env::{expand_env_vars, mask_path};
-use crate::system::privilege::is_admin;
 use crate::ui::dashboard::{banner, print_dashboard};
 use crate::ui::terminal::{clear_screen, pause, prompt};
+use std::path::Path;
 
-fn patch_root(root: &Path) {
-    println!("\x1b[96mПапка:\x1b[0m {}", mask_path(root));
-    for t in find_targets_in_path(root) {
-        print_patch_result(&t, patch_target(&t));
-    }
+fn print_error_details() {
+    println!(
+        "  Подробности для поддержки: {}",
+        crate::net::config::directory()
+            .join("network-events.log")
+            .display()
+    );
 }
 
-fn print_patch_result(t: &FoundTarget, result: Result<String, String>) {
+fn operation_error(message: &str, detail: &str) {
+    crate::net::relay::log_event(&format!("{message}: {detail}"));
+    eprintln!("  \x1b[91m✗\x1b[0m {message}");
+    eprintln!("  {detail}");
+}
+
+fn print_patch_result(
+    t: &FoundTarget,
+    result: Result<crate::core::patcher::PatchOutcome, String>,
+) -> bool {
+    use crate::core::{detector::TargetKind, patcher::PatchOutcome};
+    let label = match t.kind {
+        TargetKind::LanguageServer => "Файлы Antigravity",
+        TargetKind::AgyCli => "Командная строка Antigravity",
+        _ => "Интерфейс приложения",
+    };
     match result {
-        Ok(msg) => println!("  \x1b[92m[✓]\x1b[0m {} - {}", t.name, msg),
-        Err(e) => println!("  \x1b[31m[✗]\x1b[0m {} - {}", t.name, e),
-    }
-}
-
-fn apply_files_side() {
-    let caches = clear_ide_v8_caches();
-    println!("  \x1b[92m[✓]\x1b[0m Кэш V8 сброшен ({} папок)", caches);
-    for note in crate::core::endpoint::apply_all() {
-        println!("  \x1b[92m[✓]\x1b[0m Endpoint: {}", note);
-    }
-}
-
-fn ask_enable_auto_watcher() {
-    if !crate::core::watcher::is_watcher_running() {
-        println!("\x1b[95m[?] Включить автоматический репатч при обновлениях Antigravity ?\x1b[0m");
-        println!("  1. Да");
-        println!("  2. Нет");
-        let ans = prompt("Выберите [1-2, по умолчанию 2]: ");
-        let trimmed = ans.trim();
-        if trimmed == "1" || trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("д") || trimmed.eq_ignore_ascii_case("да") {
-            crate::core::watcher::spawn_watcher_thread(std::time::Duration::from_secs(8));
-            println!("  \x1b[92m[✓]\x1b[0m Автоматический репатч включен.\n");
-        } else {
-            println!("  \x1b[90m[--] Автоматический репатч пропущен.\x1b[0m\n");
+        Ok(PatchOutcome::NotApplicable) => {
+            println!("  \x1b[90m– {label}: без изменений\x1b[0m");
+            true
+        }
+        Ok(outcome) => {
+            let status = match outcome {
+                PatchOutcome::Restored | PatchOutcome::AlreadyStock => "восстановлены",
+                _ => "настроены",
+            };
+            println!("  \x1b[92m✓\x1b[0m {label}: {status}");
+            true
+        }
+        Err(error) => {
+            operation_error(
+                &format!("{label}: не удалось завершить операцию"),
+                &format!("{} ({}): {error}", t.name, t.path.display()),
+            );
+            false
         }
     }
 }
-
-pub fn handle_unlock_all() {
-    clear_screen();
-    banner();
-    println!("\x1b[92m=== ПОЛНАЯ РАЗБЛОКИРОВКА ===\x1b[0m\n");
-
-    ask_enable_auto_watcher();
-
-    println!("\x1b[96mПрименение патчей файлов...\x1b[0m");
+fn patch_root(root: &Path) -> bool {
+    let targets = find_targets_in_path(root);
+    if targets.is_empty() {
+        eprintln!("[✗] Нет поддерживаемых целей: {}", mask_path(root));
+        return false;
+    }
+    patch_targets(targets)
+}
+fn patch_targets(targets: Vec<FoundTarget>) -> bool {
+    let paths: Vec<_> = targets.iter().map(|target| target.path.clone()).collect();
+    if !ensure_application_closed(&paths, "включение обхода") {
+        return false;
+    }
+    let mut ok = true;
+    for t in targets {
+        ok &= print_patch_result(&t, patch_target(&t));
+    }
+    ok
+}
+fn apply_files_side() -> bool {
+    let _ = clear_ide_v8_caches();
+    let mut ok = true;
+    for note in crate::core::endpoint::apply_all() {
+        match note {
+            Ok(msg) => crate::net::relay::log_event(&msg),
+            Err(e) => {
+                ok = false;
+                operation_error("Не удалось завершить настройку", &e);
+            }
+        }
+    }
+    ok
+}
+fn patch_installations() -> bool {
     let installs = find_installations();
     if installs.is_empty() {
-        println!("\x1b[93m[!] Antigravity не найден в стандартных путях (используйте пункт 4 для ручного ввода).\x1b[0m");
+        eprintln!("[✗] Установки не найдены; укажите путь в пункте 4.");
+        return false;
     }
-    for inst in &installs {
-        patch_root(inst);
+    let targets: Vec<_> = installs
+        .iter()
+        .flat_map(|root| find_targets_in_path(root))
+        .collect();
+    if targets.is_empty() {
+        eprintln!("[✗] Файлы приложения не найдены; укажите путь в пункте 4.");
+        return false;
     }
-    apply_files_side();
-
-    println!("\n\x1b[93mНастройка сети...\x1b[0m");
-    match apply_dns_rules() {
-        Ok(msg) => println!("  \x1b[92m[✓]\x1b[0m {}", msg),
-        Err(e) => println!("  \x1b[31m[✗]\x1b[0m Ошибка сети: {}", e),
+    if !patch_targets(targets) {
+        return false;
     }
-
-    println!("\n\x1b[92mГотово. Запустите Antigravity и войдите в аккаунт.\x1b[0m");
-    pause();
+    apply_files_side()
 }
-
-pub fn handle_patch_files_only() {
+fn show_result(ok: bool) {
+    if ok {
+        println!("\n  \x1b[92mГотово. Изменения применены.\x1b[0m\n  Теперь откройте Antigravity и проверьте работу.");
+    } else {
+        eprintln!("\n  Операция не завершена. Причина указана выше.");
+        print_error_details();
+    }
+}
+pub fn handle_unlock_all() -> bool {
     clear_screen();
     banner();
-    println!("\x1b[94m=== ТОЛЬКО ФАЙЛЫ (РАБОТА БЕЗ СМЕНЫ СТРАНЫ АККАУНТА) ===\x1b[0m\n");
-
-    ask_enable_auto_watcher();
-
-    let installs = find_installations();
-    if installs.is_empty() {
-        println!("\x1b[93m[!] Antigravity не найден в стандартных путях (используйте пункт 4 для ручного ввода).\x1b[0m");
+    println!("  ВКЛЮЧЕНИЕ ОБХОДА\n");
+    if !check_vpn_before_setup() {
+        return false;
     }
-    for inst in &installs {
-        patch_root(inst);
+    if !patch_installations() {
+        show_result(false);
+        pause();
+        return false;
     }
-    apply_files_side();
-
-    println!("\n\x1b[92m[✓] Патчинг файлов завершен! Запустите Antigravity.\x1b[0m");
-    pause();
-}
-
-pub fn handle_dns_only() {
-    clear_screen();
-    banner();
-    println!("\x1b[93m=== ТОЛЬКО СЕТЬ ===\x1b[0m\n");
-
-    ask_enable_auto_watcher();
-
-    println!("Настройка сети...");
-
+    let mut ok = true;
     match apply_dns_rules() {
-        Ok(msg) => println!("\x1b[92m[✓] {}\x1b[0m", msg),
-        Err(e) => println!("\x1b[31m[✗] Ошибка сети: {}\x1b[0m", e),
+        Ok(msg) => {
+            crate::net::relay::log_event(&msg);
+            println!("  \x1b[92m✓\x1b[0m Обход через DNS настроен");
+            for note in crate::core::endpoint::apply_all() {
+                match note {
+                    Ok(msg) => crate::net::relay::log_event(&msg),
+                    Err(e) => {
+                        operation_error("Не удалось завершить настройку", &e);
+                        ok = false;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            operation_error("Не удалось настроить подключение", &e);
+            ok = false;
+        }
     }
-
+    show_result(ok);
     pause();
+    ok
+}
+pub fn handle_patch_files_only() -> bool {
+    let ok = if let Some(path) = std::env::args().nth(2) {
+        patch_root(&expand_env_vars(&path))
+    } else {
+        patch_installations()
+    };
+    show_result(ok);
+    pause();
+    ok
+}
+pub fn handle_dns_only() -> bool {
+    if !check_vpn_before_setup() {
+        return false;
+    }
+    let ok = match apply_dns_rules() {
+        Ok(msg) => {
+            crate::net::relay::log_event(&msg);
+            println!("  \x1b[92m✓\x1b[0m Обход через DNS настроен");
+            true
+        }
+        Err(e) => {
+            operation_error("Не удалось завершить настройку", &e);
+            false
+        }
+    };
+    pause();
+    ok
 }
 
+fn check_vpn_before_setup() -> bool {
+    match crate::net::preflight() {
+        Ok(()) => true,
+        Err(message) => {
+            println!("  \x1b[93mВключение обхода приостановлено\x1b[0m\n");
+            println!("  {message}\n");
+            println!("  Устраните причину и выберите этот пункт ещё раз.");
+            pause();
+            false
+        }
+    }
+}
 pub fn handle_manual_path() {
-    clear_screen();
-    banner();
-    println!("\x1b[96m=== УКАЗАТЬ ПУТЬ ВРУЧНУЮ ===\x1b[0m\n");
-    let input = prompt("Введите путь к папке или файлу Antigravity: ");
+    let input = prompt("Путь к папке или файлу Antigravity: ");
     if input.is_empty() {
         return;
     }
-
-    let p = expand_env_vars(&input);
-    if !p.exists() {
-        println!("\x1b[31m[!] Путь не существует: {}\x1b[0m", p.display());
-        pause();
-        return;
-    }
-
-    let targets = find_targets_in_path(&p);
-    if targets.is_empty() {
-        println!("\x1b[93m[!] В указанном пути целевые файлы не найдены.\x1b[0m");
-    } else {
-        println!("Найдено целей: {}\n", targets.len());
-        for t in &targets {
-            print_patch_result(t, patch_target(t));
-        }
-        apply_files_side();
-        println!("\n\x1b[92m[✓] Патчинг по указанному пути успешно завершен! Запустите Antigravity.\x1b[0m");
-    }
+    let root = expand_env_vars(input.trim().trim_matches('"'));
+    let ok = patch_root(&root);
+    show_result(ok);
     pause();
 }
+fn ensure_application_closed(paths: &[std::path::PathBuf], action: &str) -> bool {
+    let running = crate::system::file_lock::running_applications(paths).and_then(|mut running| {
+        running.extend(crate::system::file_lock::holders(paths)?);
+        running.sort();
+        running.dedup();
+        Ok(running)
+    });
+    match running {
+        Ok(holders) if !holders.is_empty() => {
+            println!("  \x1b[93mНужно закрыть Antigravity\x1b[0m");
+            println!("  Перед изменением файлов завершите IDE, CLI и языковой сервер.");
+            println!("  Сохраните работу: несохранённые изменения будут потеряны.\n");
+            if std::env::args().len() > 1 {
+                operation_error(
+                    "Закройте Antigravity и повторите команду",
+                    &holders.join(", "),
+                );
+                return false;
+            }
+            println!("  \x1b[96mВыберите действие\x1b[0m");
+            #[cfg(windows)]
+            println!("  \x1b[1m[1]\x1b[0m  Закрыть Antigravity и продолжить: {action}");
+            #[cfg(not(windows))]
+            println!("  \x1b[1m[1]\x1b[0m  Я закрыл Antigravity — проверить и продолжить");
+            println!("  \x1b[1m[0]\x1b[0m  Отмена — вернуться в меню\n");
+            loop {
+                match prompt("  Введите 1 или 0 и нажмите Enter: ").as_str() {
+                    "1" => break,
+                    "0" => {
+                        println!("  Операция отменена.");
+                        return false;
+                    }
+                    _ => println!("  Введите номер действия: 1 — продолжить, 0 — отмена."),
+                }
+            }
+            #[cfg(windows)]
+            println!("\n  Закрываем Antigravity…");
+            #[cfg(not(windows))]
+            println!("\n  Проверяем открытые файлы…");
+            if let Err(error) = crate::system::file_lock::close_application(paths) {
+                operation_error(
+                    "Не удалось закрыть приложение. Закройте его вручную",
+                    &error,
+                );
+                print_error_details();
+                pause();
+                return false;
+            }
+            println!("  \x1b[92m✓\x1b[0m Процессы Antigravity закрыты.\n");
+        }
+        Err(error) => {
+            operation_error("Не удалось проверить, закрыто ли приложение", &error);
+            print_error_details();
+            pause();
+            return false;
+        }
+        _ => {}
+    }
+    true
+}
 
-pub fn handle_rollback() {
+pub fn handle_rollback() -> bool {
+    let installs = if let Some(path) = std::env::args().nth(2) {
+        vec![expand_env_vars(&path)]
+    } else {
+        find_installations()
+    };
+    let paths: Vec<_> = installs
+        .iter()
+        .flat_map(|root| find_targets_in_path(root))
+        .map(|t| t.path)
+        .collect();
     clear_screen();
     banner();
-    println!("\x1b[91m=== ПОЛНЫЙ ОТКАТ К ИСХОДНОМУ СОСТОЯНИЮ ===\x1b[0m\n");
-
-    let installs = find_installations();
-    for inst in &installs {
-        println!("\x1b[96mПапка:\x1b[0m {}", mask_path(inst));
-        let targets = find_targets_in_path(inst);
-        for t in &targets {
-            print_patch_result(t, restore_target(t));
-        }
-
-        let app_dirs = [
-            inst.join("resources").join("app"),
-            inst.join("Contents").join("Resources").join("app"),
-        ];
-        for app_dir in app_dirs {
-            if app_dir.exists() {
-                let _ = std::fs::remove_dir_all(&app_dir);
-                println!("  \x1b[92m[✓]\x1b[0m {} удален (возврат к оригинальному app.asar)", mask_path(&app_dir));
+    println!("  ОТКЛЮЧЕНИЕ ОБХОДА\n");
+    if !ensure_application_closed(&paths, "отключение обхода") {
+        return false;
+    }
+    println!("  Восстанавливаем настройки…\n");
+    let mut ok = true;
+    for root in installs {
+        let targets = find_targets_in_path(&root);
+        if targets.is_empty() {
+            if std::env::args().nth(2).is_some() {
+                eprintln!("[✗] Цели для отката не найдены: {}", root.display());
+                ok = false;
             }
         }
+        for target in targets {
+            ok &= print_patch_result(&target, restore_target(&target));
+        }
     }
-
-    let caches = clear_ide_v8_caches();
-    println!("  \x1b[92m[✓]\x1b[0m Кэш V8 сброшен ({} папок)", caches);
-
-    crate::core::endpoint::remove_all();
-    println!("  \x1b[92m[✓]\x1b[0m jetski.cloudCodeUrl / CLOUD_CODE_URL сняты");
-
-    println!("\n\x1b[93mУдаление сетевых правил, сертификатов и служб:\x1b[0m");
-    remove_dns_rules();
-    println!("  \x1b[92m[✓]\x1b[0m Служба DNS-релея остановлена и удалена");
-    println!("  \x1b[92m[✓]\x1b[0m Правила NRPT и статические маршруты очищены");
-    println!("  \x1b[92m[✓]\x1b[0m Системный кэш DNS сброшен");
-
-    crate::system::privilege::clean_legacy_certificates();
-    println!("  \x1b[92m[✓]\x1b[0m Старые сертификаты CA очищены");
-
-    let _ = crate::net::provider::save_custom_upstream(None);
-
-    #[cfg(target_os = "windows")]
-    {
-        delete_user_env_vars(&[
-            "GEMINI_API_BASE_URL",
-            "GOOGLE_GEMINI_ENDPOINT",
-            "CLOUD_CODE_URL",
-            "NODE_EXTRA_CA_CERTS",
-            "HTTPS_PROXY",
-            "HTTP_PROXY",
-            "NO_PROXY",
-            "ALL_PROXY",
-        ]);
-        println!("  \x1b[92m[✓]\x1b[0m Переменные окружения и прокси сброшены");
+    for e in crate::core::endpoint::remove_all() {
+        operation_error("Не удалось восстановить настройки приложения", &e);
+        ok = false;
     }
-
-    println!("\n\x1b[92m=====================================================\x1b[0m");
-    println!("\x1b[92m[✓] Полный откат завершен. Всё возвращено в заводское состояние.\x1b[0m");
-    println!("\x1b[92m=====================================================\x1b[0m");
+    if let Err(e) = remove_dns_rules() {
+        operation_error("Не удалось восстановить подключение", &e);
+        ok = false;
+    }
+    if ok {
+        println!("  \x1b[92m✓\x1b[0m Настройки подключения восстановлены");
+        println!("\n  \x1b[92mОбход отключён. Можно открыть Antigravity.\x1b[0m");
+        if crate::net::socket::legacy_tcp_pending() {
+            println!("\n  Примечание: старые настройки сети из предыдущей версии сохранены.");
+            println!("  Текущий обход отключён; эти старые настройки не сбрасывались.");
+        }
+    } else {
+        eprintln!("\n  Не всё удалось восстановить. Резервные копии сохранены.");
+        print_error_details();
+    }
     pause();
+    ok
 }
 
-#[cfg(target_os = "windows")]
-fn delete_user_env_vars(names: &[&str]) {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
-    const HKEY_CURRENT_USER: usize = 0x80000001u32 as i32 as isize as usize;
-    const KEY_SET_VALUE: u32 = 0x0002;
-    const HWND_BROADCAST: usize = 0xFFFF;
-    const WM_SETTINGCHANGE: u32 = 0x001A;
-    const SMTO_ABORTIFHUNG: u32 = 0x0002;
-
-    #[link(name = "advapi32")]
-    extern "system" {
-        fn RegOpenKeyExW(hKey: usize, lpSubKey: *const u16, ulOptions: u32, samDesired: u32, phkResult: *mut usize) -> i32;
-        fn RegDeleteValueW(hKey: usize, lpValueName: *const u16) -> i32;
-        fn RegCloseKey(hKey: usize) -> i32;
-    }
-
-    #[link(name = "user32")]
-    extern "system" {
-        fn SendMessageTimeoutW(
-            hWnd: usize,
-            Msg: u32,
-            wParam: usize,
-            lParam: *const u16,
-            fuFlags: u32,
-            uTimeout: u32,
-            lpdwResult: *mut usize,
-        ) -> isize;
-    }
-
-    let wide = |s: &str| -> Vec<u16> { OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect() };
-
-    let env_subkey = wide("Environment");
-    let mut hkey: usize = 0;
-    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, env_subkey.as_ptr(), 0, KEY_SET_VALUE, &mut hkey) } == 0 {
-        for &name in names {
-            let val_name = wide(name);
-            unsafe { RegDeleteValueW(hkey, val_name.as_ptr()) };
-        }
-        unsafe { RegCloseKey(hkey) };
-
-        let env_param = wide("Environment");
-        let mut result: usize = 0;
-        unsafe {
-            SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, env_param.as_ptr(), SMTO_ABORTIFHUNG, 300, &mut result);
-        }
-    }
-}
-
-pub fn handle_diagnostics() {
+pub fn handle_diagnostics() -> bool {
     clear_screen();
     banner();
-    println!("\x1b[96m================ ДИАГНОСТИКА СИСТЕМЫ ================\x1b[0m\n");
-
-    let admin_str = if is_admin() {
-        "\x1b[92m[✓] Администратор\x1b[0m"
-    } else {
-        "\x1b[93m[!] Нет прав (запустите с правами администратора)\x1b[0m"
-    };
-    println!("  1. Права процесса:       {}", admin_str);
-
-    let (nrpt_count, _nrpt_server, is_relay) = get_nrpt_status_info();
-    let dns_str = if nrpt_count > 0 {
-        if is_relay {
-            format!("\x1b[92m[✓] Релей 127.0.0.53:53\x1b[0m (правил: {})", nrpt_count)
+    println!("  ПРОВЕРКА ПОДКЛЮЧЕНИЯ\n");
+    let reports = crate::net::health::probe_all();
+    for report in &reports {
+        let label = match report.host.as_str() {
+            "cloudcode-pa.googleapis.com" => "Основной сервер",
+            "daily-cloudcode-pa.googleapis.com" => "Резервный сервер",
+            _ => "Gemini",
+        };
+        if let Some(error) = &report.error {
+            operation_error(&format!("{label}: нет подключения"), error);
         } else {
-            format!("\x1b[92m[✓] NRPT\x1b[0m (правил: {})", nrpt_count)
-        }
-    } else {
-        "\x1b[90m[Не настроено]\x1b[0m".to_string()
-    };
-    println!("  2. Сеть и DNS (NRPT):    {}", dns_str);
-
-    let relay_running = crate::system::service::is_running();
-    let relay_enabled = crate::system::service::is_enabled();
-    let relay_str = if relay_running {
-        "\x1b[92m[✓] Работает (фоновый процесс активен)\x1b[0m"
-    } else if relay_enabled {
-        "\x1b[93m[!] Зарегистрирован, но не запущен\x1b[0m"
-    } else {
-        "\x1b[90m[-- Отключен]\x1b[0m"
-    };
-    println!("  3. Служба DNS-релея:     {}", relay_str);
-
-    let egress_info = crate::net::egress::detect();
-    let vpn_str = match egress_info {
-        Some(e) => {
-            if e.vpn_active {
-                format!("\x1b[93m[!] Активен VPN (адаптер #{}, сокеты привязаны)\x1b[0m", e.if_index)
-            } else {
-                format!("\x1b[92m[✓] Прямое соединение (адаптер #{})\x1b[0m", e.if_index)
-            }
-        }
-        None => "\x1b[90m[-- Не определен]\x1b[0m".to_string(),
-    };
-    println!("  4. Сетевой интерфейс:    {}", vpn_str);
-
-    print!("  5. Связь с Google API:   ");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    let report = crate::net::health::probe_google_api();
-    if let Some(err) = &report.error {
-        println!("\x1b[31m[✗] {}\x1b[0m", err);
-        if !report.resolved.is_empty() {
-            println!("       DNS отдал: {}", report.resolved.join(", "));
-        }
-    } else {
-        let ip_note = if report.used_ipv6 { "IPv6" } else { "IPv4" };
-        println!(
-            "\x1b[92m[✓] Доступен ({} мс, {}) — {}\x1b[0m",
-            report.latency_ms,
-            ip_note,
-            report.connected.unwrap_or_default()
-        );
-        if !report.resolved.is_empty() {
-            println!("       DNS: {}", report.resolved.join(", "));
-        }
-        if report.used_ipv6 {
-            println!("       \x1b[93m[!] Ушло в IPv6 — Google может снова видеть РФ. Релей должен глушить AAAA.\x1b[0m");
-        }
-        if report.looks_like_google {
-            println!("       \x1b[93m[!] DNS отдал адрес Google, не SNI-прокси. Подмена не сработала — будет 400 по гео.\x1b[0m");
+            println!("  \x1b[92m✓\x1b[0m {label}: доступен");
         }
     }
-
-    let doh_str = if crate::net::doh::is_doh_disabled() {
-        "\x1b[92m[✓] Auto-DoH выключен (NRPT не обходится Chromium)\x1b[0m"
-    } else {
-        "\x1b[93m[!] Auto-DoH не выключен — Electron может игнорировать NRPT\x1b[0m"
-    };
-    println!("  6. Windows DoH:          {}", doh_str);
-
-    let upstreams = crate::net::relay::load_upstream_servers();
-    if upstreams.is_empty() {
-        println!("  7. Upstream SmartDNS:    \x1b[90m[-- нет]\x1b[0m");
-    } else {
-        let list: Vec<String> = upstreams.iter().map(|ip| ip.to_string()).collect();
-        println!("  7. Upstream SmartDNS:    {}", list.join(", "));
+    println!("\n  Подключение к серверам проверено.");
+    println!("  Для проверки входа и ответов откройте Antigravity.");
+    if crate::net::socket::legacy_tcp_pending() {
+        println!("\n  Сохранены старые настройки сети из предыдущей версии.");
+        println!("  Они не относятся к текущему включению обхода.");
     }
-
-    println!("\n\x1b[96m--- Обнаруженные установки и файлы ---\x1b[0m");
-    let installs = find_installations();
-    if installs.is_empty() {
-        println!("  \x1b[93m[!] Antigravity не найден в стандартных папках.\x1b[0m");
-    } else {
-        for inst in &installs {
-            println!("  \x1b[96mПапка:\x1b[0m {}", mask_path(inst));
-            if let Some(asar) = find_asar_in_path(inst) {
-                if let Some(ver) = read_asar_package_version(&asar) {
-                    let asar_name = asar.file_name().unwrap_or_default().to_string_lossy();
-                    println!("    • Версия в ASAR:        \x1b[92m{}\x1b[0m ({})", ver, asar_name);
-                }
-            }
-            let targets = find_targets_in_path(inst);
-            for t in targets {
-                let state = check_binary_state(&t.path);
-                let state_str = match state {
-                    BinaryState::Patched => "\x1b[92m[✓ Пропатчен]\x1b[0m",
-                    BinaryState::Stock => "\x1b[93m[Исходный]\x1b[0m",
-                    BinaryState::Unknown => "\x1b[90m[Неизвестно]\x1b[0m",
-                };
-                println!("    • {:<36} {}", t.name, state_str);
-            }
+    let ok = reports.iter().all(|r| r.error.is_none());
+    for report in &reports {
+        crate::net::relay::log_event(&format!("Диагностика: {report:?}"));
+        if crate::net::route_health::store()
+            .snapshot()
+            .is_ok_and(|s| s.host_refused(&report.host, crate::net::route_health::now_ms()))
+        {
+            println!("  Недавно приложение сообщало о региональном ограничении.");
         }
     }
-
-    println!("\n\x1b[96m--- Статистика прокси и сокетов (Telemetry) ---\x1b[0m");
-    let sessions = crate::net::proxy::get_recent_sessions();
-    if sessions.is_empty() {
-        println!("  \x1b[90m[-- сессий через локальный прокси пока не зафиксировано --]\x1b[0m");
-    } else {
-        println!("  {:<28} {:<18} {:<8} {:<10} {:<10} {}", "Целевой хост", "Маршрут", "Пинг", "Tx (KB)", "Rx (KB)", "Статус");
-        for s in sessions.iter().rev().take(8) {
-            let status_colored = match s.status.as_str() {
-                "OK" => "\x1b[92mOK\x1b[0m",
-                "Timeout" => "\x1b[91mTimeout (10m)\x1b[0m",
-                _ => "\x1b[93mClosed\x1b[0m",
-            };
-            println!(
-                "  {:<28} {:<18} {:<8} {:<10.1} {:<10.1} {}",
-                if s.target.len() > 27 { &s.target[..27] } else { &s.target },
-                if s.upstream.len() > 17 { &s.upstream[..17] } else { &s.upstream },
-                format!("{}мс", s.duration_ms),
-                s.tx_bytes as f64 / 1024.0,
-                s.rx_bytes as f64 / 1024.0,
-                status_colored
-            );
-        }
+    crate::net::relay::log_event(&format!(
+        "DNS servers: {:?}; config: {:?}",
+        crate::net::relay::load_upstream_servers(),
+        crate::net::config::load()
+    ));
+    #[cfg(windows)]
+    crate::net::relay::log_event(&format!(
+        "System DoH disabled: {}",
+        crate::net::doh::is_doh_disabled()
+    ));
+    if let Some(egress) = crate::net::egress::detect() {
+        crate::net::relay::log_event(&format!("VPN active: {}", egress.vpn_active));
     }
-
-    println!("\n\x1b[92m[✓] Диагностика системы завершена.\x1b[0m");
+    if !ok {
+        print_error_details();
+    }
     pause();
-}
-
-pub fn handle_proxy_menu() {
-    clear_screen();
-    banner();
-    println!("\x1b[96m=== ЛОКАЛЬНЫЙ HTTP / SOCKS5 ПРОКСИ И PAC ГЕНЕРАТОР ===\x1b[0m\n");
-
-    let custom = crate::net::provider::load_custom_upstream();
-    if let Some(c) = &custom {
-        println!("  Текущий внешний Upstream: \x1b[92m{}:{}\x1b[0m (Авторизация: {})\n", c.host, c.port, if c.auth_header.is_some() { "Да" } else { "Нет" });
-    } else {
-        println!("  Текущий внешний Upstream: \x1b[90m[Встроенные скоростные SNI-релеи]\x1b[0m\n");
-    }
-
-    println!("1. \x1b[92mЗапустить локальные прокси\x1b[0m (HTTP: 8989, SOCKS5: 10808)");
-    println!("2. \x1b[93mНастроить свой внешний Upstream прокси\x1b[0m (VPS: http://user:pass@host:port)");
-    println!("3. \x1b[91mСбросить внешний Upstream\x1b[0m (вернуться к встроенным релеям)");
-    println!("4. \x1b[96mПосмотреть журнал сессий прокси\x1b[0m");
-    println!("0. Назад в главное меню\n");
-
-    let choice = prompt("Выберите действие [0-4]: ");
-    match choice.as_str() {
-        "1" => {
-            let http_port = crate::net::proxy::DEFAULT_HTTP_PROXY_PORT;
-            let socks5_port = crate::net::proxy::DEFAULT_SOCKS5_PROXY_PORT;
-
-            match crate::net::proxy::start_proxy_servers(http_port, socks5_port) {
-                Ok(()) => {
-                    println!("\n\x1b[92m[✓] Локальные прокси-серверы успешно запущены:\x1b[0m");
-                    println!("  • HTTP CONNECT прокси:  \x1b[96mhttp://127.0.0.1:{}\x1b[0m", http_port);
-                    println!("  • SOCKS5 прокси:        \x1b[96msocks5://127.0.0.1:{}\x1b[0m", socks5_port);
-                    println!("  • Dynamic PAC URL:      \x1b[93mhttp://127.0.0.1:{}/proxy.pac\x1b[0m\n", http_port);
-
-                    println!("\x1b[90mСелективная маршрутизация активна: 10-минутный Thinking Shield и 150s Keep-Alive включены.\x1b[0m\n");
-                    println!("Как использовать в Antigravity IDE / VS Code / Терминале:");
-                    println!("  \x1b[33msetx HTTP_PROXY \"http://127.0.0.1:{}\"\x1b[0m", http_port);
-                    println!("  \x1b[33msetx HTTPS_PROXY \"http://127.0.0.1:{}\"\x1b[0m", http_port);
-                    println!("  \x1b[33msetx ALL_PROXY \"socks5://127.0.0.1:{}\"\x1b[0m\n", socks5_port);
-                }
-                Err(e) => {
-                    println!("\x1b[93m[i] {}\x1b[0m", e);
-                }
-            }
-            pause();
-        }
-        "2" => {
-            println!("\nВведите адрес вашего зарубежного HTTP/SOCKS5 прокси.");
-            println!("Примеры:  http://45.155.204.190:8080");
-            println!("          http://user:password@my-vps.com:3128");
-            let url = prompt("Upstream URL: ");
-            if !url.trim().is_empty() {
-                if let Err(e) = crate::net::provider::save_custom_upstream(Some(&url)) {
-                    println!("\x1b[31m[✗] Ошибка сохранения: {}\x1b[0m", e);
-                } else {
-                    println!("\x1b[92m[✓] Внешний Upstream прокси успешно сохранен.\x1b[0m");
-                }
-            }
-            pause();
-        }
-        "3" => {
-            let _ = crate::net::provider::save_custom_upstream(None);
-            println!("\n\x1b[92m[✓] Пользовательский Upstream сброшен. Используются встроенные релеи.\x1b[0m");
-            pause();
-        }
-        "4" => {
-            println!("\n\x1b[96m--- Последние сессии через прокси ---\x1b[0m");
-            let sessions = crate::net::proxy::get_recent_sessions();
-            if sessions.is_empty() {
-                println!("  \x1b[90m[-- Нет активных записей --]\x1b[0m");
-            } else {
-                for s in sessions.iter().rev() {
-                    println!("  [{}] {} ➔ {} ({}мс) tx: {}B, rx: {}B [{}]", s.timestamp_epoch, s.target, s.upstream, s.duration_ms, s.tx_bytes, s.rx_bytes, s.status);
-                }
-            }
-            pause();
-        }
-        _ => {}
-    }
-}
-
-pub fn handle_watcher_menu() {
-    clear_screen();
-    banner();
-    println!("\x1b[95m=== АВТОМАТИЧЕСКИЙ РЕПАТЧЕР ПРИ ОБНОВЛЕНИЯХ (WATCHER) ===\x1b[0m\n");
-
-    println!("Выполняется мгновенный аудит и репатч...");
-    let count = crate::core::watcher::scan_and_repatch();
-    if count == 0 {
-        println!("\x1b[92m[✓] Все установленные бинарники и файлы Antigravity уже в пропатченном состоянии.\x1b[0m\n");
-    }
-
-    println!("1. Запустить фоновый мониторинг (проверка каждые 8 секунд в текущем окне)");
-    println!("2. Включить фоновый поток и вернуться в меню");
-    println!("0. Назад в главное меню\n");
-
-    match prompt("Выберите действие [0-2]: ").as_str() {
-        "1" => {
-            crate::core::watcher::run_watcher_loop(std::time::Duration::from_secs(8));
-        }
-        "2" => {
-            crate::core::watcher::spawn_watcher_thread(std::time::Duration::from_secs(8));
-            println!("\x1b[92m[✓] Фоновый поток мониторинга активен.\x1b[0m");
-            pause();
-        }
-        _ => {}
-    }
+    ok
 }
 
 pub fn run_app() {
@@ -511,23 +375,31 @@ pub fn run_app() {
         banner();
         print_dashboard();
 
-        println!("1. \x1b[92mПолная разблокировка\x1b[0m (Файлы + SmartDNS)");
-        println!("2. \x1b[94mТолько файлы\x1b[0m (Работа без смены страны аккаунта)");
-        println!("3. \x1b[93mТолько DNS и сеть\x1b[0m (Работа без VPN)");
-        println!("4. \x1b[95mУказать путь вручную\x1b[0m (к папке или файлу Antigravity)");
-        println!("5. \x1b[96mДиагностика и проверка связи\x1b[0m");
-        println!("6. \x1b[91mПОЛНЫЙ ОТКАТ\x1b[0m (вернуть всё в исходное состояние)");
-        println!("0. Выход\n");
+        println!("  \x1b[92m[1]\x1b[0m  Включить обход");
+        println!("  [2]  Настроить только файлы приложения");
+        println!("  [3]  Настроить только подключение");
+        println!("  [4]  Указать папку Antigravity");
+        println!("  \x1b[96m[5]\x1b[0m  Проверить подключение");
+        println!("  \x1b[91m[6]\x1b[0m  Отключить обход");
+        println!("\n  [0]  Выход\n");
 
         match prompt("Выберите действие [0-6]: ").as_str() {
-            "1" => handle_unlock_all(),
-            "2" => handle_patch_files_only(),
-            "3" => handle_dns_only(),
+            "1" => {
+                handle_unlock_all();
+            }
+            "2" => {
+                handle_patch_files_only();
+            }
+            "3" => {
+                handle_dns_only();
+            }
             "4" => handle_manual_path(),
-            "5" => handle_diagnostics(),
-            "6" => handle_rollback(),
-            "7" => handle_proxy_menu(),
-            "8" => handle_watcher_menu(),
+            "5" => {
+                handle_diagnostics();
+            }
+            "6" => {
+                handle_rollback();
+            }
             "0" => {
                 clear_screen();
                 break;

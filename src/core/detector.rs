@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
 use crate::core::asar::read_asar_package_version;
-use crate::core::patcher::{check_binary_state, BinaryState};
+use crate::core::patcher::BinaryState;
 use crate::system::env::expand_env_vars;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetKind {
@@ -25,6 +25,10 @@ pub struct SystemComponentsStatus {
     pub cli_status: Option<BinaryState>,
     pub asar_version: Option<String>,
     pub has_installations: bool,
+    pub ide_installations: Vec<PathBuf>,
+    pub incomplete_ide_installations: Vec<PathBuf>,
+    pub cli_launchers: Vec<PathBuf>,
+    pub ide_cli_available: bool,
 }
 
 pub fn find_asar_in_path(root: &Path) -> Option<PathBuf> {
@@ -36,7 +40,9 @@ pub fn find_asar_in_path(root: &Path) -> Option<PathBuf> {
         root.join("Contents").join("Resources").join("app.asar"),
         root.join("Contents").join("Resources").join("app1.asar"),
     ];
-    asar_candidates.into_iter().find(|p| p.exists() && p.is_file())
+    asar_candidates
+        .into_iter()
+        .find(|p| p.exists() && p.is_file())
 }
 
 fn is_already_contained(installs: &[PathBuf], candidate: &Path) -> bool {
@@ -68,6 +74,7 @@ pub fn find_installations() -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let candidates = [
+            r"%LOCALAPPDATA%\agy",
             r"%LOCALAPPDATA%\Programs\Antigravity",
             r"%LOCALAPPDATA%\Programs\antigravity",
             r"%LOCALAPPDATA%\Programs\Antigravity IDE",
@@ -100,8 +107,15 @@ pub fn find_installations() -> Vec<PathBuf> {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_dir() {
-                            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                            if (name.contains("antigravity") || name.starts_with("google.antigravity")) && !is_already_contained(&installs, &path) {
+                            let name = path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_lowercase();
+                            if (name.contains("antigravity")
+                                || name.starts_with("google.antigravity"))
+                                && !is_already_contained(&installs, &path)
+                            {
                                 installs.push(path);
                             }
                         }
@@ -150,8 +164,15 @@ pub fn find_installations() -> Vec<PathBuf> {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_dir() {
-                            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                            if (name.contains("antigravity") || name.starts_with("google.antigravity")) && !installs.contains(&path) {
+                            let name = path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_lowercase();
+                            if (name.contains("antigravity")
+                                || name.starts_with("google.antigravity"))
+                                && !installs.contains(&path)
+                            {
                                 installs.push(path);
                             }
                         }
@@ -198,8 +219,15 @@ pub fn find_installations() -> Vec<PathBuf> {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_dir() {
-                            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                            if (name.contains("antigravity") || name.starts_with("google.antigravity")) && !installs.contains(&path) {
+                            let name = path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_lowercase();
+                            if (name.contains("antigravity")
+                                || name.starts_with("google.antigravity"))
+                                && !installs.contains(&path)
+                            {
                                 installs.push(path);
                             }
                         }
@@ -209,14 +237,53 @@ pub fn find_installations() -> Vec<PathBuf> {
         }
     }
 
+    // Discover native CLI installations outside the fixed application folders.
+    // Only inspect named executables; never recursively scan every PATH directory.
+    let mut cli_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    for home in crate::system::env::get_user_homes() {
+        cli_dirs.push(home.join(".local/bin"));
+        cli_dirs.push(home.join(".agy/bin"));
+    }
+    for dir in cli_dirs {
+        for name in ["agy.exe", "agy"] {
+            let path = dir.join(name);
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            if native_executable(&path) && !is_already_contained(&installs, &path) {
+                installs.push(path);
+            }
+        }
+    }
     installs
+}
+
+fn native_executable(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && (magic.starts_with(b"MZ")
+            || magic == *b"\x7fELF"
+            || matches!(
+                magic,
+                [0xcf, 0xfa, 0xed, 0xfe]
+                    | [0xfe, 0xed, 0xfa, 0xcf]
+                    | [0xca, 0xfe, 0xba, 0xbe]
+                    | [0xbe, 0xba, 0xfe, 0xca]
+            ))
 }
 
 pub fn find_targets_in_path(root: &Path) -> Vec<FoundTarget> {
     let mut targets = Vec::new();
 
     if root.is_file() {
-        let name = root.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let name = root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let kind = if name.ends_with(".asar") {
             TargetKind::IdeAsar
         } else if name.ends_with(".js") {
@@ -255,16 +322,42 @@ pub fn find_targets_in_path(root: &Path) -> Vec<FoundTarget> {
         PathBuf::from("resources").join("bin"),
         PathBuf::from("resources").join("app"),
         PathBuf::from("resources").join("app").join("bin"),
-        PathBuf::from("resources").join("app").join("extensions").join("antigravity").join("bin"),
-        PathBuf::from("resources").join("app.asar.unpacked").join("bin"),
-        PathBuf::from("resources").join("app.asar.unpacked").join("extensions").join("antigravity").join("bin"),
+        PathBuf::from("resources")
+            .join("app")
+            .join("extensions")
+            .join("antigravity")
+            .join("bin"),
+        PathBuf::from("resources")
+            .join("app.asar.unpacked")
+            .join("bin"),
+        PathBuf::from("resources")
+            .join("app.asar.unpacked")
+            .join("extensions")
+            .join("antigravity")
+            .join("bin"),
         PathBuf::from("Contents").join("Resources"),
         PathBuf::from("Contents").join("Resources").join("bin"),
         PathBuf::from("Contents").join("Resources").join("app"),
-        PathBuf::from("Contents").join("Resources").join("app").join("bin"),
-        PathBuf::from("Contents").join("Resources").join("app").join("extensions").join("antigravity").join("bin"),
-        PathBuf::from("Contents").join("Resources").join("app.asar.unpacked").join("bin"),
-        PathBuf::from("Contents").join("Resources").join("app.asar.unpacked").join("extensions").join("antigravity").join("bin"),
+        PathBuf::from("Contents")
+            .join("Resources")
+            .join("app")
+            .join("bin"),
+        PathBuf::from("Contents")
+            .join("Resources")
+            .join("app")
+            .join("extensions")
+            .join("antigravity")
+            .join("bin"),
+        PathBuf::from("Contents")
+            .join("Resources")
+            .join("app.asar.unpacked")
+            .join("bin"),
+        PathBuf::from("Contents")
+            .join("Resources")
+            .join("app.asar.unpacked")
+            .join("extensions")
+            .join("antigravity")
+            .join("bin"),
         PathBuf::from("Contents").join("MacOS"),
     ];
 
@@ -276,7 +369,7 @@ pub fn find_targets_in_path(root: &Path) -> Vec<FoundTarget> {
 
         for &bn in &bin_names {
             let p = dir.join(bn);
-            if p.is_file() {
+            if p.is_file() && (!bn.starts_with("agy") || native_executable(&p)) {
                 let kind = if bn.starts_with("agy") {
                     TargetKind::AgyCli
                 } else {
@@ -309,8 +402,15 @@ pub fn find_targets_in_path(root: &Path) -> Vec<FoundTarget> {
             .join("code")
             .join("electron-main")
             .join("main.js"),
-        PathBuf::from("resources").join("app").join("out").join("main.js"),
-        PathBuf::from("Contents").join("Resources").join("app").join("out").join("main.js"),
+        PathBuf::from("resources")
+            .join("app")
+            .join("out")
+            .join("main.js"),
+        PathBuf::from("Contents")
+            .join("Resources")
+            .join("app")
+            .join("out")
+            .join("main.js"),
         PathBuf::from("out")
             .join("vs")
             .join("code")
@@ -357,7 +457,9 @@ fn walk_targets(dir: &Path, depth: usize, max_depth: usize, targets: &mut Vec<Fo
     if depth > max_depth {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return; };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
@@ -392,8 +494,10 @@ fn walk_targets(dir: &Path, depth: usize, max_depth: usize, targets: &mut Vec<Fo
             let is_ls = (file_name.starts_with("language_server")
                 && (file_name.ends_with(".exe") || !file_name.contains('.')))
                 && !file_name.ends_with(".bak");
-            let is_agy = (file_name == "agy.exe" || file_name == "agy" || file_name.starts_with("agy-"))
-                && !file_name.ends_with(".bak");
+            let is_agy =
+                (file_name == "agy.exe" || file_name == "agy" || file_name.starts_with("agy-"))
+                    && !file_name.ends_with(".bak")
+                    && native_executable(&entry.path());
 
             if is_ls || is_agy {
                 let kind = if is_agy {
@@ -412,7 +516,9 @@ fn walk_targets(dir: &Path, depth: usize, max_depth: usize, targets: &mut Vec<Fo
             } else if file_name == "main.js" {
                 let path = entry.path();
                 let path_str = path.to_string_lossy();
-                if (path_str.contains("electron-main") || path_str.ends_with(r"out\main.js") || path_str.ends_with("out/main.js"))
+                if (path_str.contains("electron-main")
+                    || path_str.ends_with(r"out\main.js")
+                    || path_str.ends_with("out/main.js"))
                     && !targets.iter().any(|t| t.path == path)
                 {
                     targets.push(FoundTarget {
@@ -427,33 +533,92 @@ fn walk_targets(dir: &Path, depth: usize, max_depth: usize, targets: &mut Vec<Fo
 }
 
 fn update_component_state(current: &mut Option<BinaryState>, new_state: BinaryState) {
-    match current {
-        None => *current = Some(new_state),
-        Some(BinaryState::Patched) => {
-            // Highest priority state, keep Patched
+    *current = Some(match *current {
+        None => new_state,
+        Some(old) if old == new_state => old,
+        Some(BinaryState::Unknown) => BinaryState::Unknown,
+        Some(_) if new_state == BinaryState::Unknown => BinaryState::Unknown,
+        Some(_) => BinaryState::PartiallyPatched,
+    });
+}
+
+#[cfg(test)]
+mod detection_tests {
+    use super::*;
+    #[test]
+    fn installed_ide_with_missing_resources_is_not_absent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Antigravity IDE.exe"), b"MZ00").unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let status = status_for_installations(&roots);
+        assert_eq!(status.ide_installations, roots);
+        assert_eq!(status.incomplete_ide_installations, roots);
+        assert!(!status.ide_cli_available);
+        let app = root.path().join("resources/app");
+        std::fs::create_dir_all(app.join("out")).unwrap();
+        std::fs::write(app.join("package.json"), b"{}").unwrap();
+        std::fs::write(app.join("out/main.js"), b"// unknown UI version").unwrap();
+        std::fs::write(app.join("out/cli.js"), b"// IDE launcher").unwrap();
+        let status = status_for_installations(&roots);
+        assert!(status.incomplete_ide_installations.is_empty());
+        assert!(status.ide_cli_available);
+        assert_eq!(status.ide_status, Some(BinaryState::Unknown));
+    }
+    #[test]
+    fn cli_scripts_and_backups_are_not_binary_patch_targets() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["agy", "agy-helper.js", "agy-x64.exe.bak"] {
+            std::fs::write(root.path().join(name), b"#!/bin/sh\necho launcher").unwrap();
         }
-        Some(BinaryState::Stock) => {
-            if new_state == BinaryState::Patched {
-                *current = Some(BinaryState::Patched);
-            }
-        }
-        Some(BinaryState::Unknown) => {
-            if new_state != BinaryState::Unknown {
-                *current = Some(new_state);
-            }
-        }
+        std::fs::write(root.path().join("agy-x64.exe"), b"MZ00").unwrap();
+        let targets = find_targets_in_path(root.path());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].kind, TargetKind::AgyCli);
+        assert_eq!(targets[0].name, "agy-x64.exe");
     }
 }
 
 pub fn get_quick_status() -> SystemComponentsStatus {
-    let mut status = SystemComponentsStatus::default();
     let installs = find_installations();
+    status_for_installations(&installs)
+}
+
+fn status_for_installations(installs: &[PathBuf]) -> SystemComponentsStatus {
+    let mut status = SystemComponentsStatus::default();
     status.has_installations = !installs.is_empty();
 
-    for inst in &installs {
+    for inst in installs {
+        let app = if inst.join("Contents").is_dir() {
+            inst.join("Contents/Resources/app")
+        } else {
+            inst.join("resources/app")
+        };
+        // Presence of the installed application is independent of a known patch pattern.
+        let ide_present = inst.join("Antigravity IDE.exe").is_file()
+            || app.join("product.json").is_file()
+            || (inst
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().contains("IDE.app"))
+                && inst.join("Contents/MacOS").is_dir());
+        if ide_present {
+            status.ide_installations.push(inst.clone());
+            if !app.join("package.json").is_file()
+                || !(app.join("out/main.js").is_file()
+                    || app.join("out/vs/code/electron-main/main.js").is_file())
+            {
+                status.incomplete_ide_installations.push(inst.clone());
+            }
+            status.ide_cli_available |= app.join("out/cli.js").is_file();
+        }
+        for name in ["agy.cmd", "agy.ps1", "agy"] {
+            let launcher = inst.join("bin").join(name);
+            if launcher.is_file() && !native_executable(&launcher) {
+                status.cli_launchers.push(launcher);
+            }
+        }
         let targets = find_targets_in_path(inst);
         for t in targets {
-            let state = check_binary_state(&t.path);
+            let state = crate::core::patcher::check_target_state(&t);
             match t.kind {
                 TargetKind::LanguageServer => {
                     update_component_state(&mut status.core_status, state);
@@ -469,6 +634,20 @@ pub fn get_quick_status() -> SystemComponentsStatus {
         if status.asar_version.is_none() {
             if let Some(asar) = find_asar_in_path(inst) {
                 status.asar_version = read_asar_package_version(&asar);
+            }
+        }
+    }
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["agy.cmd", "agy.ps1", "agy"] {
+                let path = dir.join(name);
+                if path.is_file()
+                    && !native_executable(&path)
+                    && !status.cli_launchers.contains(&path)
+                {
+                    status.cli_launchers.push(path);
+                }
             }
         }
     }

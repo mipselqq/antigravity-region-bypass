@@ -43,11 +43,17 @@ pub fn prompt(text: &str) -> String {
             std::process::exit(0);
         }
         Ok(_) => buf.trim().to_string(),
-        Err(_) => String::new(),
+        Err(error) => {
+            eprintln!("Не удалось прочитать ввод: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
 pub fn pause() {
+    if std::env::args().len() > 1 {
+        return;
+    }
     println!();
     prompt("Нажмите Enter для продолжения...");
 }

@@ -22,6 +22,14 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary_name: antigravity-bypass-russia.exe
             release_name: antigravity-bypass-russia.exe
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary_name: antigravity-bypass-russia
+            release_name: antigravity-bypass-russia-macos-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary_name: antigravity-bypass-russia
+            release_name: antigravity-bypass-russia-macos-x64
 
 
     steps:
@@ -33,14 +41,25 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Regression tests (isolated fixtures; destructive harnesses remain ignored)
+        run: cargo test --locked --bin antigravity-bypass-russia --target ${{ matrix.target }}
+
+      - name: Launcher compatibility
+        run: python tests/verify_wrappers.py
+
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify release binary and tag
+        run: python tests/verify_release.py target/${{ matrix.target }}/release/${{ matrix.binary_name }}
 
       - name: Prepare binary artifact
-        shell: bash
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/${{ matrix.release_name }}
+        run: python scripts/package_release.py --binary target/${{ matrix.target }}/release/${{ matrix.binary_name }} --target ${{ matrix.target }}
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
@@ -64,18 +83,13 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Package release assets
-        run: |
-          ls -la dist/
-          cp scripts/unlock_and_restore.ps1 dist/
-          cp scripts/unlock_and_restore.sh dist/
-          chmod +x dist/antigravity-bypass-russia-* dist/*.sh 2>/dev/null || true
-
       - name: Create Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
             dist/*
-          generate_release_notes: true
+          body_path: RELEASE_NOTES_1.3.0.md
+          draft: true
+          generate_release_notes: false
           append_body: false

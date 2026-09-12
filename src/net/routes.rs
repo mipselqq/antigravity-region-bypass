@@ -1,138 +1,179 @@
-use std::fs;
-use std::net::Ipv4Addr;
-use std::path::PathBuf;
-use std::process::Command;
+use serde::{Deserialize, Serialize};
+use std::{fs, net::Ipv4Addr, path::PathBuf};
 
-use crate::net::egress::detect_physical;
-use crate::net::resolvers::all_provider_v4;
-use crate::system::process::no_window;
-
-pub fn set_ipv4_preference() {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = no_window(&mut Command::new("netsh"))
-            .args(["interface", "ipv6", "set", "prefixpolicy", "::ffff:0:0/96", "46", "4"])
-            .output();
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct OwnedRoute {
+    ip: Ipv4Addr,
+    gateway: Ipv4Addr,
+    interface: u32,
+}
+fn state_path() -> PathBuf {
+    super::relay::log_dir().join("owned_routes.json")
+}
+fn load() -> Result<Vec<OwnedRoute>, String> {
+    match fs::read(state_path()) {
+        Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("Журнал маршрутов: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.to_string()),
     }
 }
-
-pub fn restore_ipv4_preference() {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = no_window(&mut Command::new("netsh"))
-            .args(["interface", "ipv6", "set", "prefixpolicy", "::ffff:0:0/96", "35", "4"])
-            .output();
-    }
+fn save(routes: &[OwnedRoute]) -> Result<(), String> {
+    fs::create_dir_all(super::relay::log_dir()).map_err(|e| e.to_string())?;
+    crate::system::fs_utils::robust_write_file(
+        &state_path(),
+        &serde_json::to_vec(routes).map_err(|e| e.to_string())?,
+    )
 }
-
-fn extra_path() -> PathBuf {
-    crate::net::relay::log_dir().join("proxy_host_routes.conf")
-}
-
-fn load_extra() -> Vec<Ipv4Addr> {
-    let Ok(text) = fs::read_to_string(extra_path()) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|l| l.trim().parse::<Ipv4Addr>().ok())
-        .collect()
-}
-
-fn save_extra(ips: &[Ipv4Addr]) {
-    let dir = crate::net::relay::log_dir();
-    let _ = fs::create_dir_all(&dir);
-    let body = ips
-        .iter()
-        .map(|ip| ip.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let _ = fs::write(extra_path(), body);
-}
-
 #[cfg(target_os = "windows")]
-fn pin_via_physical(ips: &[String]) {
-    let Some((if_index, gateway)) = detect_physical() else {
-        return;
-    };
-    let if_index = if_index.to_string();
-    for ip in ips {
-        let _ = no_window(&mut Command::new("route"))
-            .args(["delete", ip])
-            .output();
-        let _ = no_window(&mut Command::new("route"))
-            .args([
-                "add",
+fn powershell(script: &str) -> Result<String, String> {
+    let script = format!(
+        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; try {{ & {{ {script} }}; exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}"
+    );
+    let out = crate::system::process::no_window(&mut std::process::Command::new("powershell.exe"))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim()
+        } else {
+            stdout.trim()
+        };
+        return Err(format!(
+            "Маршруты (код {}): {}",
+            out.status,
+            if detail.is_empty() {
+                "PowerShell завершился без сообщения об ошибке"
+            } else {
+                detail
+            }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().into())
+}
+pub fn sync_physical_hosts(extra: &[Ipv4Addr]) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let (interface, gateway) =
+            super::egress::detect_physical().ok_or("Не найден физический адаптер")?;
+        let gateway: Ipv4Addr = gateway.parse().map_err(|_| "Некорректный шлюз")?;
+        let mut owned = load()?;
+        let mut ips: Vec<Ipv4Addr> = super::resolvers::all_provider_v4()
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        ips.extend(extra);
+        // Bootstrap HTTPS DNS through the same physical route, without asking
+        // the VPN's system resolver how to reach the DoH provider.
+        ips.extend(
+            super::config::load()?
+                .doh
+                .into_iter()
+                .flat_map(|p| p.bootstrap)
+                .filter_map(|ip| {
+                    if let std::net::IpAddr::V4(ip) = ip {
+                        Some(ip)
+                    } else {
+                        None
+                    }
+                }),
+        );
+        ips.sort();
+        ips.dedup();
+        for ip in ips {
+            let route = OwnedRoute {
                 ip,
-                "mask",
-                "255.255.255.255",
-                &gateway,
-                "metric",
-                "1",
-                "if",
-                &if_index,
-            ])
-            .output();
+                gateway,
+                interface,
+            };
+            let script = format!("$r=@(Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | Where-Object {{ $_.DestinationPrefix -eq '{ip}/32' }}); if ($r.Count -gt 0) {{ if (@($r | Where-Object {{ $_.InterfaceIndex -eq {interface} -and $_.NextHop -eq '{gateway}' }}).Count -gt 0) {{ 'present' }} else {{ throw 'Конфликт существующего маршрута {ip}/32; он сохранён' }} }} else {{ 'missing' }}");
+            if powershell(&script)? == "present" {
+                continue;
+            }
+            if !owned.contains(&route) {
+                owned.push(route.clone());
+                save(&owned)?;
+            }
+            powershell(&format!("$ErrorActionPreference='Stop'; New-NetRoute -DestinationPrefix '{ip}/32' -InterfaceIndex {interface} -NextHop '{gateway}' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null"))?;
+        }
     }
-}
-
-/// /32 through the physical NIC for SmartDNS *and* the ranked Cloud Code
-/// proxy IPs, so HTTPS does not follow a full-tunnel VPN default route.
-pub fn sync_physical_hosts(extra: &[Ipv4Addr]) {
     #[cfg(not(target_os = "windows"))]
-    {
-        let _ = extra;
-        return;
-    }
+    let _ = extra;
+    Ok(())
+}
+pub fn add_static_routes() -> Result<(), String> {
+    sync_physical_hosts(&[])
+}
+pub fn remove_static_routes() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        let mut extra_u: Vec<Ipv4Addr> = Vec::new();
-        for ip in extra {
-            if !extra_u.contains(ip) {
-                extra_u.push(*ip);
-            }
+        let owned = load()?;
+        let mut remaining = owned.clone();
+        for route in owned {
+            powershell(&remove_route_script(&route))?;
+            remaining.retain(|r| r != &route);
+            save(&remaining)?;
         }
-        let old = load_extra();
-        for ip in &old {
-            if !extra_u.contains(ip) && !all_provider_v4().iter().any(|s| s.parse::<Ipv4Addr>().ok() == Some(*ip)) {
-                let _ = no_window(&mut Command::new("route"))
-                    .args(["delete", &ip.to_string()])
-                    .output();
-            }
+        if state_path().exists() {
+            fs::remove_file(state_path()).map_err(|e| e.to_string())?;
         }
-        save_extra(&extra_u);
-
-        let mut all: Vec<String> = all_provider_v4().into_iter().map(|s| s.to_string()).collect();
-        for ip in extra_u {
-            let s = ip.to_string();
-            if !all.contains(&s) {
-                all.push(s);
-            }
-        }
-        pin_via_physical(&all);
     }
+    Ok(())
 }
 
-pub fn add_static_routes() {
-    #[cfg(target_os = "windows")]
-    {
-        let ips: Vec<String> = all_provider_v4().into_iter().map(|s| s.to_string()).collect();
-        pin_via_physical(&ips);
-    }
+#[cfg(windows)]
+fn remove_route_script(route: &OwnedRoute) -> String {
+    // Query the table first: an absent exact-prefix query is a CIM error even
+    // with SilentlyContinue, and can make powershell.exe return exit code 1.
+    format!("$ownedMatches=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Where-Object {{ $_.DestinationPrefix -eq '{}/32' -and $_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' -and $_.RouteMetric -eq 1 }}); foreach ($ownedMatch in $ownedMatches) {{ $ownedMatch | Remove-NetRoute -Confirm:$false -ErrorAction Stop }}", route.ip, route.interface, route.gateway)
 }
 
-pub fn remove_static_routes() {
-    #[cfg(target_os = "windows")]
-    {
-        for ip in all_provider_v4() {
-            let _ = no_window(&mut Command::new("route"))
-                .args(["delete", ip])
-                .output();
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    fn route() -> OwnedRoute {
+        OwnedRoute {
+            ip: "192.0.2.25".parse().unwrap(),
+            gateway: "192.0.2.1".parse().unwrap(),
+            interface: 7,
         }
-        for ip in load_extra() {
-            let _ = no_window(&mut Command::new("route"))
-                .args(["delete", &ip.to_string()])
-                .output();
-        }
-        let _ = fs::remove_file(extra_path());
+    }
+
+    #[test]
+    fn missing_route_cleanup_succeeds_without_deleting_anything() {
+        let script = format!("function Get-NetRoute {{ param($AddressFamily,$PolicyStore,$ErrorAction) }}; function Remove-NetRoute {{ throw 'unexpected delete' }}; {}", remove_route_script(&route()));
+        assert_eq!(powershell(&script).unwrap(), "");
+    }
+
+    #[test]
+    fn cleanup_only_deletes_the_exact_owned_route() {
+        let script = format!(
+            r#"
+function Get-NetRoute {{ param($AddressFamily,$PolicyStore,$ErrorAction)
+    foreach ($item in @(@('192.0.2.25/32',7,'192.0.2.1',1), @('192.0.2.25/32',8,'192.0.2.1',1), @('192.0.2.25/32',7,'192.0.2.2',1), @('192.0.2.25/32',7,'192.0.2.1',9), @('192.0.2.26/32',7,'192.0.2.1',1))) {{
+        [pscustomobject]@{{DestinationPrefix=$item[0];InterfaceIndex=$item[1];NextHop=$item[2];RouteMetric=$item[3]}}
+    }}
+}}
+function Remove-NetRoute {{ [CmdletBinding(SupportsShouldProcess)]param([Parameter(ValueFromPipeline)]$InputObject) process {{ 'removed ' + $InputObject.DestinationPrefix + ' ' + $InputObject.InterfaceIndex + ' ' + $InputObject.NextHop + ' ' + $InputObject.RouteMetric }} }}
+{}
+"#,
+            remove_route_script(&route())
+        );
+        assert_eq!(
+            powershell(&script).unwrap(),
+            "removed 192.0.2.25/32 7 192.0.2.1 1"
+        );
+    }
+
+    #[test]
+    fn real_query_failure_is_not_reported_as_success() {
+        let script = format!(
+            "function Get-NetRoute {{ throw 'Не удалось прочитать маршруты' }}; {}",
+            remove_route_script(&route())
+        );
+        let error = powershell(&script).unwrap_err();
+        assert!(error.contains("Не удалось прочитать маршруты"), "{error}");
     }
 }

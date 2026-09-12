@@ -1,5 +1,214 @@
 use std::process::Command;
 
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct RunningProcess {
+    pub pid: u32,
+    pub parent: u32,
+    pub executable: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+struct Handle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for Handle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn image_path(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buffer = vec![0u16; 32768];
+    let mut length = buffer.len() as u32;
+    if unsafe {
+        windows_sys::Win32::System::Threading::QueryFullProcessImageNameW(
+            handle,
+            0,
+            buffer.as_mut_ptr(),
+            &mut length,
+        )
+    } == 0
+    {
+        return None;
+    }
+    Some(std::ffi::OsString::from_wide(&buffer[..length as usize]).into())
+}
+
+#[cfg(windows)]
+pub fn snapshot() -> Result<Vec<RunningProcess>, String> {
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::{Diagnostics::ToolHelp::*, Threading::*},
+    };
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "Список процессов: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let handle = Handle(raw);
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut result = Vec::new();
+    let mut more = unsafe { Process32FirstW(handle.0, &mut entry) };
+    while more != 0 {
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID) };
+        let executable = if raw.is_null() {
+            None
+        } else {
+            image_path(Handle(raw).0)
+        };
+        // Keep parent links even when a protected process cannot be inspected.
+        result.push(RunningProcess {
+            pid: entry.th32ProcessID,
+            parent: entry.th32ParentProcessID,
+            executable: executable.unwrap_or_default(),
+        });
+        more = unsafe { Process32NextW(handle.0, &mut entry) };
+    }
+    Ok(result)
+}
+
+#[cfg(windows)]
+pub fn ancestor_pids(processes: &[RunningProcess], current: u32) -> std::collections::HashSet<u32> {
+    let mut protected = std::collections::HashSet::new();
+    let mut pid = current;
+    while pid != 0 && protected.insert(pid) {
+        match processes.iter().find(|p| p.pid == pid) {
+            Some(p) => pid = p.parent,
+            None => break,
+        }
+    }
+    protected
+}
+
+#[cfg(all(test, windows))]
+mod shutdown_tests {
+    fn query_only_child() -> (super::Handle, std::process::Child) {
+        use windows_sys::Win32::System::Threading::*;
+        let child = super::no_window(&mut std::process::Command::new("powershell.exe"))
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .spawn()
+            .unwrap();
+        // Deliberately omit PROCESS_TERMINATE to reproduce an access denial.
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                child.id(),
+            )
+        };
+        assert!(!raw.is_null());
+        (super::Handle(raw), child)
+    }
+
+    #[test]
+    fn denied_termination_is_success_when_process_finishes_shortly_afterward() {
+        let (handle, mut child) = query_only_child();
+        let pid = child.id();
+        let finishing = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            child.kill().unwrap();
+            child.wait().unwrap();
+        });
+        let result = super::terminate_handle(handle.0, pid);
+        finishing.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn denied_termination_remains_error_if_process_is_still_running() {
+        let (handle, mut child) = query_only_child();
+        let result = super::terminate_handle(handle.0, child.id());
+        let running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(running);
+        assert!(result.unwrap_err().contains("os error 5"));
+    }
+
+    #[test]
+    fn protects_patcher_terminal_and_ide_ancestors_without_protecting_siblings() {
+        let processes: Vec<_> = [(10, 20), (20, 30), (30, 40), (40, 40), (50, 30)]
+            .into_iter()
+            .map(|(pid, parent)| super::RunningProcess {
+                pid,
+                parent,
+                executable: Default::default(),
+            })
+            .collect();
+        let protected = super::ancestor_pids(&processes, 10);
+        assert_eq!(protected, [10, 20, 30, 40].into_iter().collect());
+        assert!(!protected.contains(&50));
+    }
+}
+
+#[cfg(windows)]
+pub fn terminate_verified(process: &RunningProcess) -> Result<(), String> {
+    use windows_sys::Win32::{Foundation::ERROR_INVALID_PARAMETER, System::Threading::*};
+    if process.pid == std::process::id() {
+        return Err("Нельзя завершить процесс патчера".into());
+    }
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            process.pid,
+        )
+    };
+    if raw.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(());
+        }
+        return Err(format!("Доступ к PID {}: {error}", process.pid));
+    }
+    let handle = Handle(raw);
+    // Validate through the very handle being terminated, not a name/task tree.
+    if unsafe { WaitForSingleObject(handle.0, 0) } == 0 {
+        return Ok(());
+    }
+    if image_path(handle.0).as_ref() != Some(&process.executable) {
+        return Err(format!(
+            "Процесс PID {} изменился; повторите операцию",
+            process.pid
+        ));
+    }
+    terminate_handle(handle.0, process.pid)
+}
+
+#[cfg(windows)]
+fn terminate_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    pid: u32,
+) -> Result<(), String> {
+    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+    if unsafe { TerminateProcess(handle, 0) } == 0 {
+        // ERROR_ACCESS_DENIED also occurs during an asynchronous exit. Preserve
+        // the original error, then allow the process to reach its signaled state.
+        let error = std::io::Error::last_os_error();
+        if unsafe { WaitForSingleObject(handle, 1000) } == 0 {
+            return Ok(());
+        }
+        return Err(format!("Завершение PID {}: {}", pid, error));
+    }
+    unsafe {
+        WaitForSingleObject(handle, 1000);
+    }
+    Ok(())
+}
+
 #[inline]
 pub fn no_window(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
@@ -55,7 +264,11 @@ pub fn stop_processes_by_names(names: &[&str]) -> usize {
         fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut std::ffi::c_void;
         fn Process32FirstW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
         fn Process32NextW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
-        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut std::ffi::c_void;
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut std::ffi::c_void;
         fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32) -> i32;
         fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
     }
@@ -85,11 +298,21 @@ pub fn stop_processes_by_names(names: &[&str]) -> usize {
     if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
         loop {
             if entry.th32_process_id != my_pid && entry.th32_process_id != 0 {
-                let null_pos = entry.sz_exe_file.iter().position(|&c| c == 0).unwrap_or(entry.sz_exe_file.len());
-                let exe_name = OsString::from_wide(&entry.sz_exe_file[..null_pos]).to_string_lossy().to_lowercase();
+                let null_pos = entry
+                    .sz_exe_file
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.sz_exe_file.len());
+                let exe_name = OsString::from_wide(&entry.sz_exe_file[..null_pos])
+                    .to_string_lossy()
+                    .to_lowercase();
 
-                if target_names_lower.iter().any(|target| target == &exe_name || target == &format!("{}.exe", exe_name)) {
-                    let h_proc = unsafe { OpenProcess(PROCESS_TERMINATE, 0, entry.th32_process_id) };
+                if target_names_lower
+                    .iter()
+                    .any(|target| target == &exe_name || target == &format!("{}.exe", exe_name))
+                {
+                    let h_proc =
+                        unsafe { OpenProcess(PROCESS_TERMINATE, 0, entry.th32_process_id) };
                     if !h_proc.is_null() {
                         if unsafe { TerminateProcess(h_proc, 1) } != 0 {
                             killed += 1;
@@ -107,50 +330,4 @@ pub fn stop_processes_by_names(names: &[&str]) -> usize {
 
     unsafe { CloseHandle(snapshot) };
     killed
-}
-
-pub fn kill_processes() {
-    #[cfg(target_os = "windows")]
-    {
-        let procs = [
-            "Antigravity.exe",
-            "Antigravity IDE.exe",
-            "language_server_windows_x64.exe",
-            "language_server_windows_arm64.exe",
-            "language_server.exe",
-            "agy.exe",
-            "ag_dns.exe",
-        ];
-        stop_processes_by_names(&procs);
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let unix_proc_patterns = [
-            "Antigravity",
-            "Antigravity IDE",
-            "antigravity",
-            "antigravity-ide",
-            "Google Antigravity",
-            "language_server",
-            "language_server_darwin_arm64",
-            "language_server_darwin_x64",
-            "language_server_linux_x64",
-            "language_server_linux_arm64",
-            "agy",
-            "ag_dns",
-        ];
-
-        // Step 1: SIGTERM (graceful)
-        for p in &unix_proc_patterns {
-            let _ = Command::new("pkill").args(["-15", "-f", p]).output();
-            let _ = Command::new("killall").args(["-15", p]).output();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        // Step 2: SIGKILL (ensure terminated)
-        for p in &unix_proc_patterns {
-            let _ = Command::new("pkill").args(["-9", "-f", p]).output();
-            let _ = Command::new("killall").args(["-9", p]).output();
-        }
-    }
 }

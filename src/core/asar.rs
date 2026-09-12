@@ -1,186 +1,139 @@
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
-use crate::core::opcodes::regex_ide_main_js_stock;
-use crate::system::fs_utils::robust_write_file;
+use super::patcher::{plan_js, Plan};
+use serde_json::Value;
+use std::{fs, path::Path};
 
-pub fn read_asar_package_version(asar_path: &Path) -> Option<String> {
-    let mut file = File::open(asar_path).ok()?;
-    let mut header = [0u8; 16];
-    file.read_exact(&mut header).ok()?;
-
-    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-    if magic != 4 {
-        return None;
+fn archive(data: &[u8]) -> Result<(Value, usize), String> {
+    let read_u32 = |offset: usize| -> Result<u32, String> {
+        Ok(u32::from_le_bytes(
+            data.get(offset..offset + 4)
+                .ok_or("Короткий ASAR")?
+                .try_into()
+                .unwrap(),
+        ))
+    };
+    if read_u32(0)? != 4 {
+        return Err("Некорректный ASAR".into());
     }
-    let header_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
-    let json_size = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
-
-    if json_size > 32 * 1024 * 1024 {
-        return None;
+    let payload = (read_u32(4)? as usize)
+        .checked_add(8)
+        .ok_or("ASAR overflow")?;
+    let json_len = read_u32(12)? as usize;
+    if json_len > 32 * 1024 * 1024 || payload > data.len() || 16 + json_len > payload {
+        return Err("Некорректный размер ASAR header".into());
     }
-
-    let mut json_bytes = vec![0u8; json_size];
-    file.read_exact(&mut json_bytes).ok()?;
-
-    let finder = memchr::memmem::Finder::new(b"\"package.json\"");
-    let pkg_idx = finder.find(&json_bytes)?;
-
-    let window_end = (pkg_idx + 1024).min(json_bytes.len());
-    let window = String::from_utf8_lossy(&json_bytes[pkg_idx..window_end]);
-
-    let offset = extract_json_num(&window, "offset")?;
-    let size = extract_json_num(&window, "size")? as usize;
-
-    if size == 0 || size > 5 * 1024 * 1024 {
-        return None;
-    }
-
-    let payload_start = 8 + header_size;
-    file.seek(SeekFrom::Start(payload_start + offset)).ok()?;
-    let mut pkg_bytes = vec![0u8; size];
-    file.read_exact(&mut pkg_bytes).ok()?;
-
-    let pkg_str = String::from_utf8_lossy(&pkg_bytes);
-    extract_json_string(&pkg_str, "version")
+    let header =
+        serde_json::from_slice(&data[16..16 + json_len]).map_err(|e| format!("ASAR JSON: {e}"))?;
+    Ok((header, payload))
 }
-
-fn extract_json_num(s: &str, key: &str) -> Option<u64> {
-    let key_pat = format!("\"{}\"", key);
-    let key_pos = s.find(&key_pat)?;
-    let after_key = &s[key_pos + key_pat.len()..];
-    let colon_pos = after_key.find(':')?;
-    let val_str = after_key[colon_pos + 1..].trim_start();
-
-    if let Some(stripped) = val_str.strip_prefix('"') {
-        let end_quote = stripped.find('"')?;
-        stripped[..end_quote].parse::<u64>().ok()
-    } else {
-        let num_str: String = val_str.chars().take_while(|c| c.is_ascii_digit()).collect();
-        num_str.parse::<u64>().ok()
+fn entry<'a>(header: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut value = header;
+    for component in path.split('/') {
+        value = value.get("files")?.get(component)?;
     }
+    Some(value)
 }
-
-fn extract_json_string(s: &str, key: &str) -> Option<String> {
-    let key_pat = format!("\"{}\"", key);
-    let key_pos = s.find(&key_pat)?;
-    let after_key = &s[key_pos + key_pat.len()..];
-    let colon_pos = after_key.find(':')?;
-    let val_str = after_key[colon_pos + 1..].trim_start();
-    let stripped = val_str.strip_prefix('"')?;
-    let end_quote = stripped.find('"')?;
-    Some(stripped[..end_quote].to_string())
+fn content_range(
+    entry: &Value,
+    payload: usize,
+    length: usize,
+) -> Result<std::ops::Range<usize>, String> {
+    if entry.get("unpacked").and_then(Value::as_bool) == Some(true) || entry.get("link").is_some() {
+        return Err("ASAR entry unpacked/link".into());
+    }
+    let offset = entry
+        .get("offset")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<usize>().ok())
+                .or_else(|| v.as_u64().and_then(|n| usize::try_from(n).ok()))
+        })
+        .ok_or("ASAR offset")?;
+    let size = entry
+        .get("size")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or("ASAR size")?;
+    let start = payload.checked_add(offset).ok_or("ASAR offset overflow")?;
+    let end = start
+        .checked_add(size)
+        .filter(|n| *n <= length)
+        .ok_or("ASAR entry вне файла")?;
+    Ok(start..end)
 }
-
-fn chunked_contains(path: &Path, needles: &[&[u8]]) -> Option<usize> {
-    let mut file = File::open(path).ok()?;
-    let overlap = needles.iter().map(|n| n.len()).max().unwrap_or(1).saturating_sub(1);
-    let mut buf = vec![0u8; 1024 * 1024];
-    let mut carry: Vec<u8> = Vec::new();
-    loop {
-        let n = file.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
+pub fn read_asar_package_version(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    let (header, payload) = archive(&data).ok()?;
+    let range = content_range(entry(&header, "package.json")?, payload, data.len()).ok()?;
+    let package: Value = serde_json::from_slice(&data[range]).ok()?;
+    package.get("version")?.as_str().map(str::to_string)
+}
+pub(crate) fn plan_asar(data: &[u8]) -> Result<Plan, String> {
+    let (header, payload) = archive(data)?;
+    let mut result = Plan {
+        data: data.to_vec(),
+        changes: 0,
+        existing: 0,
+        profile: "asar-ide-reset-tier-v1".into(),
+    };
+    for name in [
+        "out/main.js",
+        "out/vs/code/electron-main/main.js",
+        "main.js",
+    ] {
+        let Some(file) = entry(&header, name) else {
+            continue;
+        };
+        let range = content_range(file, payload, data.len())?;
+        let p = plan_js(&data[range.clone()])?;
+        if p.changes > 0 && file.get("integrity").is_some() {
+            return Err("ASAR содержит integrity-метаданные: эта упаковка пока не поддерживается; архив сохранён".into());
         }
-        let mut chunk = carry.clone();
-        chunk.extend_from_slice(&buf[..n]);
-        for (i, needle) in needles.iter().enumerate() {
-            if memchr::memmem::find(&chunk, needle).is_some() {
-                return Some(i);
-            }
-        }
-        carry.clear();
-        if overlap > 0 && chunk.len() >= overlap {
-            carry.extend_from_slice(&chunk[chunk.len() - overlap..]);
-        }
+        result.changes += p.changes;
+        result.existing += p.existing;
+        result.data[range].copy_from_slice(&p.data);
     }
-    None
+    Ok(result)
 }
 
-/// Some(true) patched, Some(false) stock, None unknown.
-pub fn asar_js_is_patched(path: &Path) -> Option<bool> {
-    const PATCHED: &[&[u8]] = &[
-        b"resetIsTierGCPTos(),true",
-        b"resetIsTierGCPTos();true",
-        b"resetIsTierGCPTos(),!0",
-        b"resetIsTierGCPTos();!0",
-    ];
-    const STOCK: &[&[u8]] = &[b".isGoogleInternal"];
-    if chunked_contains(path, PATCHED).is_some() {
-        return Some(true);
-    }
-    if chunked_contains(path, STOCK).is_some() {
-        return Some(false);
-    }
-    None
-}
-
-/// Size-preserving in-place patch of `isGoogleInternal` inside app.asar.
-pub fn patch_asar_main_js(path: &Path) -> Result<String, String> {
-    if asar_js_is_patched(path) == Some(true) {
-        return Ok("Уже пропатчен (app.asar)".to_string());
-    }
-
-    let data = fs::read(path).map_err(|e| format!("Чтение asar: {}", e))?;
-    let needle = b"resetIsTierGCPTos";
-    let finder = memchr::memmem::Finder::new(needle);
-    let re = regex_ide_main_js_stock();
-    let mut patches: Vec<(usize, usize, Vec<u8>)> = Vec::new();
-    let mut pos = 0usize;
-
-    while let Some(idx) = finder.find(&data[pos..]) {
-        let abs = pos + idx;
-        let win_end = (abs + 240).min(data.len());
-        let window = &data[abs..win_end];
-        if let Ok(s) = std::str::from_utf8(window) {
-            if let Some(caps) = re.captures(s) {
-                let full = caps.get(0).unwrap();
-                let prefix = caps.get(1).unwrap();
-                let rest_start = abs + prefix.end();
-                let rest_end = abs + full.end();
-                let rest_len = rest_end - rest_start;
-                if rest_len >= 4 {
-                    let mut repl = b"true".to_vec();
-                    repl.extend(std::iter::repeat(b' ').take(rest_len - 4));
-                    patches.push((rest_start, rest_end, repl));
-                }
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture(js: &[u8], integrity: bool) -> Vec<u8> {
+        let mut node = serde_json::json!({"size": js.len(), "offset":"0"});
+        if integrity {
+            node["integrity"] = serde_json::json!({"hash":"example"});
         }
-        pos = abs + needle.len();
-    }
-
-    if patches.is_empty() {
-        return Ok(
-            "В этой версии IDE нет isGoogleInternal в app.asar (гейт в Core) — файл не трогаем"
-                .to_string(),
-        );
-    }
-
-    let bak = path.with_extension("asar.bak");
-    if !bak.exists() {
-        let _ = fs::copy(path, &bak);
-    }
-
-    let mut data = data;
-    for (start, end, repl) in &patches {
-        data[*start..*end].copy_from_slice(repl);
-    }
-    robust_write_file(path, &data)?;
-    Ok(format!(
-        "app.asar пропатчен (замен: {}, размер сохранён)",
-        patches.len()
-    ))
-}
-
-pub fn restore_asar_main_js(path: &Path) -> Result<String, String> {
-    let bak = path.with_extension("asar.bak");
-    if bak.exists() {
-        if let Ok(data) = fs::read(&bak) {
-            if data.len() > 1000 {
-                robust_write_file(path, &data)?;
-                return Ok("app.asar восстановлен из .asar.bak".to_string());
-            }
+        let header =
+            serde_json::to_vec(&serde_json::json!({"files":{"out":{"files":{"main.js":node}}}}))
+                .unwrap();
+        let header_size = 8 + (header.len() + 3) / 4 * 4;
+        let mut data = Vec::new();
+        for value in [
+            4,
+            header_size as u32,
+            (header_size - 4) as u32,
+            header.len() as u32,
+        ] {
+            data.extend(value.to_le_bytes());
         }
+        data.extend(header);
+        data.resize(8 + header_size, 0);
+        data.extend(js);
+        data
     }
-    Ok("Нет бэкапа app.asar — оставлен как есть".to_string())
+    #[test]
+    fn unrelated_internal_marker_does_not_trigger_watcher() {
+        let p = plan_asar(&fixture(b"x.isGoogleInternal", false)).unwrap();
+        assert_eq!((p.changes, p.existing), (0, 0));
+    }
+    #[test]
+    fn patches_complete_js_entry_and_refuses_integrity_archive() {
+        let js = "x.resetIsTierGCPTos(),x.isGoogleInternal; // привет".as_bytes();
+        let input = fixture(js, false);
+        let p = plan_asar(&input).unwrap();
+        assert_eq!(p.changes, 1);
+        assert_eq!(p.data.len(), input.len());
+        assert_eq!(plan_asar(&p.data).unwrap().existing, 1);
+        assert!(plan_asar(&fixture(js, true)).is_err());
+    }
 }

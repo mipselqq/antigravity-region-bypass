@@ -62,7 +62,7 @@ pub fn check_single_instance() -> bool {
             std::mem::forget(file);
             true
         } else {
-            true
+            false
         }
     }
 

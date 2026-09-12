@@ -1,27 +1,25 @@
-//! Rank substituted proxy IPs by TLS speed and keep a short fallback list.
+//! Rank substituted proxy IPs by TLS/HTTP latency and keep a short fallback list.
 //!
-//! DNS queries never wait on this: ranking is done at unlock and in a
-//! sleeping relay thread. Hosts gets every live IP, fastest first, so the
-//! client has a backup if the leader dies before the next full scan.
+//! Discovery runs at unlock and in the background. The relay serves fresh
+//! ranked routes immediately and probes stale candidates before using them.
+//! Static hosts pins are retained only if the adaptive relay cannot start.
 
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::net::client::{answer_addrs, build_query};
 use crate::net::hosts::write_entries as write_hosts_entries;
 use crate::net::provider::NRPT_AGENT;
-use crate::net::resolvers::{self, Verdict};
 use crate::net::relay::{self, load_if_index};
+use crate::net::resolvers;
 use crate::net::routes;
 
-const FULL_EVERY: Duration = Duration::from_secs(12 * 60 * 60);
-const WATCH_EVERY: Duration = Duration::from_secs(15 * 60);
+const FULL_EVERY: Duration = Duration::from_secs(5 * 60);
+const WATCH_EVERY: Duration = Duration::from_secs(15);
 const START_DELAY: Duration = Duration::from_secs(20);
-const LEADER_TCP_BUDGET: Duration = Duration::from_millis(400);
-const MIN_RESCAN_AFTER_DEAD: Duration = Duration::from_secs(2 * 60);
+const MIN_RESCAN_AFTER_DEAD: Duration = Duration::from_secs(60);
 const MAX_FALLBACKS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,88 +29,217 @@ pub struct RankedHost {
 }
 
 pub fn rank_path() -> PathBuf {
-    relay::log_dir().join("proxy_rank.conf")
+    super::config::directory().join("proxy_rank.conf")
 }
 
-pub fn spawn_background() {
-    thread::spawn(|| {
+pub fn spawn_background(manage_system: bool) {
+    thread::spawn(move || {
         thread::sleep(START_DELAY);
         let mut last_full = Instant::now()
             .checked_sub(FULL_EVERY)
             .unwrap_or_else(Instant::now);
+        let mut seen_revision = 0;
         loop {
-            let stale = file_age()
-                .map(|a| a >= FULL_EVERY)
-                .unwrap_or(true);
-            let leader_dead = leader_tcp_dead();
+            let stale = file_age().map(|a| a >= FULL_EVERY).unwrap_or(true);
+            let leader_dead = any_path_dead();
+            let revision = super::route_health::store()
+                .snapshot()
+                .map(|s| s.revision)
+                .unwrap_or(0);
+            let refused = revision != seen_revision;
+            seen_revision = revision;
             let since = last_full.elapsed();
-            let run = (leader_dead && since >= MIN_RESCAN_AFTER_DEAD)
+            let run = refused
+                || (leader_dead && since >= MIN_RESCAN_AFTER_DEAD)
                 || (stale && since >= WATCH_EVERY)
                 || (stale && !rank_path().exists());
             if run {
-                let why = if leader_dead { "leader-down" } else { "periodic" };
-                let ranked = rescan_agent(load_if_index());
-                relay::log_line(&format!("rank {} {}", why, format_notes(&ranked).join("; ")));
+                let why = if leader_dead { "path-down" } else { "periodic" };
+                let ranked = rescan(load_if_index(), manage_system);
+                match ranked {
+                    Ok(r) => {
+                        relay::log_line(&format!("rank {} {}", why, format_notes(&r).join("; ")))
+                    }
+                    Err(e) => relay::log_fatal(&format!("rank: {e}")),
+                }
+                if refused && manage_system {
+                    #[cfg(windows)]
+                    let _ = crate::system::process::no_window(&mut std::process::Command::new(
+                        "ipconfig",
+                    ))
+                    .arg("/flushdns")
+                    .output();
+                    #[cfg(target_os = "macos")]
+                    let _ = std::process::Command::new("dscacheutil")
+                        .arg("-flushcache")
+                        .output();
+                }
                 last_full = Instant::now();
-            } else {
+            } else if manage_system {
                 // VPN may have wiped /32s; cheap to re-pin current proxy IPs.
                 refresh_routes_from_disk();
+            }
+            for host in NRPT_AGENT {
+                let _ = resolvers::resolve_best(
+                    &super::client::build_query(host, 0xB712),
+                    load_if_index(),
+                );
             }
             thread::sleep(WATCH_EVERY);
         }
     });
 }
 
-pub fn rescan_agent(if_index: u32) -> Vec<RankedHost> {
+pub fn rescan_agent(if_index: u32) -> Result<Vec<RankedHost>, String> {
+    rescan(if_index, true)
+}
+
+fn rescan(if_index: u32, manage_system: bool) -> Result<Vec<RankedHost>, String> {
+    resolvers::invalidate_network_caches();
     let previous = load();
-    let mut ranked = Vec::new();
-    for name in NRPT_AGENT {
-        let host = name.trim_start_matches('.').to_string();
-        let mut candidates: Vec<IpAddr> = Vec::new();
-        let q = build_query(&host, 0x524B);
-        if let Some(hit) = resolvers::resolve_best(&q, if_index) {
-            if hit.verdict == Verdict::Substituted {
-                for a in answer_addrs(&hit.reply) {
-                    if !candidates.contains(&a) {
-                        candidates.push(a);
+    let candidates = thread::scope(|scope| {
+        let jobs: Vec<_> = NRPT_AGENT
+            .iter()
+            .map(|name| {
+                let previous = &previous;
+                scope.spawn(move || {
+                    let host = name.trim_start_matches('.').to_string();
+                    let mut addresses = resolvers::substituted_ips(&host, if_index);
+                    if let Some(old) = previous.iter().find(|h| h.host == host) {
+                        for (ip, _) in &old.ips {
+                            if !addresses.contains(&IpAddr::V4(*ip)) {
+                                addresses.push(IpAddr::V4(*ip));
+                            }
+                        }
                     }
+                    for seed in crate::net::provider::GEOHIDE_PROXY_V4 {
+                        if let Ok(ip) = seed.parse() {
+                            if !addresses.contains(&ip) {
+                                addresses.push(ip);
+                            }
+                        }
+                    }
+                    addresses.truncate(32);
+                    (host, addresses)
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .filter_map(|j| j.join().ok())
+            .collect::<Vec<_>>()
+    });
+    if manage_system {
+        let all: Vec<_> = candidates
+            .iter()
+            .flat_map(|(_, ips)| ips.iter())
+            .filter_map(|ip| {
+                if let IpAddr::V4(ip) = ip {
+                    Some(*ip)
+                } else {
+                    None
                 }
-            }
-        }
-        if let Some(old) = previous.iter().find(|h| h.host == host) {
-            for (ip, _) in &old.ips {
-                let a = IpAddr::V4(*ip);
-                if !candidates.contains(&a) {
-                    candidates.push(a);
-                }
-            }
-        }
-        for seed in crate::net::provider::GEOHIDE_PROXY_V4 {
-            if let Ok(v4) = seed.parse::<Ipv4Addr>() {
-                let a = IpAddr::V4(v4);
-                if !candidates.contains(&a) {
-                    candidates.push(a);
-                }
-            }
-        }
-        let mut ips = resolvers::rank_tls_v4(&candidates, &host);
-        if ips.is_empty() {
-            if let Some(old) = previous.iter().find(|h| h.host == host) {
-                ranked.push(old.clone());
-            }
-            continue;
-        }
-        if ips.len() > MAX_FALLBACKS {
-            ips.truncate(MAX_FALLBACKS);
-        }
-        ranked.push(RankedHost { host, ips });
+            })
+            .collect();
+        routes::sync_physical_hosts(&all)?;
     }
-    if ranked.iter().any(|h| !h.ips.is_empty()) {
-        save(&ranked);
-        apply_hosts(&ranked);
-        routes::sync_physical_hosts(&ranked_ips(&ranked));
+    let ranked = thread::scope(|scope| {
+        let jobs: Vec<_> = candidates
+            .into_iter()
+            .map(|(host, candidates)| {
+                scope.spawn(move || {
+                    let measured = resolvers::rank_paths_v4(&candidates, &host);
+                    let keys: Vec<_> = measured
+                        .iter()
+                        .map(|(ip, _)| super::route_health::Key::ip(&host, (*ip, 443).into()))
+                        .collect();
+                    let order = super::route_health::order(&keys)?;
+                    let ips = order
+                        .iter()
+                        .filter_map(|k| k.route.parse::<std::net::SocketAddr>().ok())
+                        .filter_map(|a| {
+                            measured
+                                .iter()
+                                .find(|(ip, _)| IpAddr::V4(*ip) == a.ip())
+                                .copied()
+                        })
+                        .take(MAX_FALLBACKS)
+                        .collect();
+                    Ok::<_, String>(RankedHost { host, ips })
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|j| j.join().map_err(|_| "Прервано ранжирование".to_string())?)
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+    validate_ranked(&ranked)?;
+    save(&ranked)?;
+    if manage_system {
+        // The running relay must own answers; hosts entries would bypass its health/region decisions.
+        if !std::env::args().any(|a| a == crate::system::service::FORWARDER_FLAG) {
+            apply_hosts(&ranked)?;
+        }
+        routes::sync_physical_hosts(&ranked_ips(&ranked))?;
     }
-    ranked
+    Ok(ranked)
+}
+
+fn validate_ranked(ranked: &[RankedHost]) -> Result<(), String> {
+    if ranked
+        .iter()
+        .filter(|h| {
+            h.host == "cloudcode-pa.googleapis.com" || h.host == "daily-cloudcode-pa.googleapis.com"
+        })
+        .all(|h| h.ips.is_empty())
+    {
+        return Err("Нет проверенного TLS/HTTP-пути к Cloud Code; прежние пользовательские настройки сохранены".into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointChoice {
+    Native,
+    Daily,
+    Uncertain,
+}
+
+pub fn endpoint_choice() -> EndpointChoice {
+    if file_age().is_none_or(|age| age > Duration::from_secs(60)) {
+        return EndpointChoice::Uncertain;
+    }
+    let Ok(state) = super::route_health::store().snapshot() else {
+        return EndpointChoice::Uncertain;
+    };
+    let mut ranked = load();
+    for host in &mut ranked {
+        host.ips.retain(|(ip, _)| {
+            let key = super::route_health::Key::ip(&host.host, (*ip, 443).into());
+            match state.cached(&key, super::route_health::now_ms()) {
+                Some(ok) => ok,
+                None => super::health::check_ip((*ip, 443).into(), &host.host, false).is_ok(),
+            }
+        });
+    }
+    choose_endpoint(&ranked)
+}
+fn choose_endpoint(ranked: &[RankedHost]) -> EndpointChoice {
+    let has = |name: &str| ranked.iter().any(|h| h.host == name && !h.ips.is_empty());
+    if has("cloudcode-pa.googleapis.com") {
+        EndpointChoice::Native
+    } else if has("daily-cloudcode-pa.googleapis.com") {
+        EndpointChoice::Daily
+    } else {
+        EndpointChoice::Uncertain
+    }
+}
+
+pub fn candidates_for(host: &str) -> Vec<Ipv4Addr> {
+    load()
+        .into_iter()
+        .filter(|h| h.host == super::route_health::host_name(host))
+        .flat_map(|h| h.ips.into_iter().map(|(ip, _)| ip))
+        .collect()
 }
 
 pub fn format_notes(ranked: &[RankedHost]) -> Vec<String> {
@@ -136,25 +263,46 @@ fn file_age() -> Option<Duration> {
     SystemTime::now().duration_since(modified).ok()
 }
 
-fn leader_tcp_dead() -> bool {
+fn any_path_dead() -> bool {
     let ranked = load();
-    let Some(first) = ranked.iter().find(|h| !h.ips.is_empty()) else {
-        return false;
-    };
-    let ip = first.ips[0].0;
-    !tcp443_fresh(ip)
+    let outcomes = thread::scope(|scope| {
+        let jobs: Vec<_> = ranked
+            .iter()
+            .flat_map(|h| h.ips.iter().map(move |(ip, _)| (*ip, h.host.clone())))
+            .map(|(ip, host)| {
+                scope.spawn(move || {
+                    let ok = super::health::check_ip((ip, 443).into(), &host, true).is_ok();
+                    (ip, host, ok)
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .filter_map(|j| j.join().ok())
+            .collect::<Vec<_>>()
+    });
+    needs_refresh(&ranked, |ip, host| {
+        outcomes
+            .iter()
+            .any(|(a, h, ok)| *a == ip && h == host && *ok)
+    })
 }
 
-fn tcp443_fresh(ip: Ipv4Addr) -> bool {
-    if let Ok(stream) = TcpStream::connect_timeout(
-        &SocketAddr::new(IpAddr::V4(ip), 443),
-        LEADER_TCP_BUDGET,
-    ) {
-        let _ = crate::net::socket::configure_tcp_stream(&stream);
-        true
-    } else {
-        false
+fn needs_refresh(ranked: &[RankedHost], mut probe: impl FnMut(Ipv4Addr, &str) -> bool) -> bool {
+    if ranked.len() != NRPT_AGENT.len() {
+        return true;
     }
+    let mut failed = false;
+    for host in ranked {
+        if host.ips.is_empty() {
+            failed = true;
+        }
+        for (ip, _) in &host.ips {
+            if !probe(*ip, &host.host) {
+                failed = true;
+            }
+        }
+    }
+    failed
 }
 
 fn ranked_ips(ranked: &[RankedHost]) -> Vec<Ipv4Addr> {
@@ -172,28 +320,27 @@ fn ranked_ips(ranked: &[RankedHost]) -> Vec<Ipv4Addr> {
 fn refresh_routes_from_disk() {
     let ips = ranked_ips(&load());
     if !ips.is_empty() {
-        routes::sync_physical_hosts(&ips);
-    }
-}
-
-fn apply_hosts(ranked: &[RankedHost]) {
-    let mut entries: Vec<(String, Ipv4Addr)> = Vec::new();
-    for h in ranked {
-        // Pin ONLY the single fastest leader IP for each host into hosts file.
-        // This prevents Windows getaddrinfo and Electron Happy Eyeballs from attempting
-        // slower fallback IPs and causing 1-3s connection stalling.
-        if let Some((best_ip, _)) = h.ips.first() {
-            entries.push((h.host.clone(), *best_ip));
+        if let Err(e) = routes::sync_physical_hosts(&ips) {
+            relay::log_fatal(&e);
         }
     }
-    if !entries.is_empty() {
-        let _ = write_hosts_entries(&entries);
+}
+
+fn apply_hosts(ranked: &[RankedHost]) -> Result<(), String> {
+    let entries: Vec<_> = ranked
+        .iter()
+        .flat_map(|h| h.ips.iter().map(move |(ip, _)| (h.host.clone(), *ip)))
+        .collect();
+    if entries.is_empty() {
+        crate::net::hosts::remove_entries()
+    } else {
+        write_hosts_entries(&entries)
     }
 }
 
-fn save(ranked: &[RankedHost]) {
-    let dir = relay::log_dir();
-    let _ = fs::create_dir_all(&dir);
+fn save(ranked: &[RankedHost]) -> Result<(), String> {
+    let dir = super::config::directory();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -204,7 +351,8 @@ fn save(ranked: &[RankedHost]) {
             out.push_str(&format!("{} {} {}\n", h.host, ip, ms));
         }
     }
-    let _ = fs::write(rank_path(), out);
+    crate::system::fs_utils::robust_write_file(&rank_path(), out.as_bytes())?;
+    super::config::inherit_directory_owner(&rank_path())
 }
 
 fn load() -> Vec<RankedHost> {
@@ -238,4 +386,70 @@ fn load() -> Vec<RankedHost> {
         }
     }
     ranked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failed_cloudcode_scan_is_rejected_before_persistence() {
+        assert!(validate_ranked(&[]).is_err());
+        let mut hosts = vec![
+            RankedHost {
+                host: "cloudcode-pa.googleapis.com".into(),
+                ips: vec![],
+            },
+            RankedHost {
+                host: "generativelanguage.googleapis.com".into(),
+                ips: vec![(Ipv4Addr::LOCALHOST, 1)],
+            },
+        ];
+        assert!(validate_ranked(&hosts).is_err());
+        hosts.push(RankedHost {
+            host: "daily-cloudcode-pa.googleapis.com".into(),
+            ips: vec![(Ipv4Addr::LOCALHOST, 1)],
+        });
+        assert!(validate_ranked(&hosts).is_ok());
+    }
+    #[test]
+    fn native_endpoint_is_preferred_and_daily_requires_a_verified_alternative() {
+        let row = |host: &str| RankedHost {
+            host: host.into(),
+            ips: vec![(Ipv4Addr::LOCALHOST, 1)],
+        };
+        assert_eq!(choose_endpoint(&[]), EndpointChoice::Uncertain);
+        assert_eq!(
+            choose_endpoint(&[row("daily-cloudcode-pa.googleapis.com")]),
+            EndpointChoice::Daily
+        );
+        assert_eq!(
+            choose_endpoint(&[
+                row("daily-cloudcode-pa.googleapis.com"),
+                row("cloudcode-pa.googleapis.com")
+            ]),
+            EndpointChoice::Native
+        );
+        assert_eq!(
+            choose_endpoint(&[row("generativelanguage.googleapis.com")]),
+            EndpointChoice::Uncertain
+        );
+    }
+    #[test]
+    fn every_host_and_fallback_is_checked_even_if_the_first_host_is_healthy() {
+        let ranked: Vec<_> = NRPT_AGENT
+            .iter()
+            .map(|h| RankedHost {
+                host: h.to_string(),
+                ips: vec![(Ipv4Addr::LOCALHOST, 1), (Ipv4Addr::new(127, 0, 0, 2), 2)],
+            })
+            .collect();
+        let mut calls = 0;
+        assert!(needs_refresh(&ranked, |_, h| {
+            calls += 1;
+            h != NRPT_AGENT[1]
+        }));
+        assert_eq!(calls, 6);
+        assert!(!needs_refresh(&ranked, |_, _| true));
+        assert!(needs_refresh(&[], |_, _| true));
+    }
 }

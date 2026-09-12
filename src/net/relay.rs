@@ -1,3 +1,5 @@
+use crate::net::client::{nodata_response, question_name, question_type};
+use crate::net::resolvers;
 use std::fs;
 use std::io::Write;
 use std::net::{Ipv4Addr, UdpSocket};
@@ -5,11 +7,44 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use crate::net::client::{nodata_response, question_name, question_type};
-use crate::net::resolvers;
 
+// Darwin requires a locally assigned address; do not require a lo0 alias.
+#[cfg(target_os = "macos")]
+pub const LISTEN_IP: &str = "127.0.0.1";
+#[cfg(not(target_os = "macos"))]
 pub const LISTEN_IP: &str = "127.0.0.53";
 pub const LISTEN_PORT: u16 = 53;
+pub const HEALTH_PORT: u16 = 15353;
+pub const HEALTH_NAME: &str = "antigravity-relay-health.invalid";
+
+/// Check local port 53 independently of Internet DNS or the relay's startup.
+pub fn local_dns_available() -> Result<bool, String> {
+    let receiver =
+        UdpSocket::bind("127.0.0.254:53").map_err(|e| format!("Проверка локального DNS: {e}"))?;
+    receiver
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|e| e.to_string())?;
+    let sender = UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let packet = crate::net::client::build_query(HEALTH_NAME, 0xA657);
+    sender
+        .send_to(&packet, receiver.local_addr().map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let mut bytes = [0u8; 512];
+    match receiver.recv_from(&mut bytes) {
+        Ok((n, peer)) => {
+            Ok(peer == sender.local_addr().map_err(|e| e.to_string())? && bytes[..n] == packet)
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
 #[cfg(target_os = "macos")]
 const WORKER_THREADS: usize = 1;
 #[cfg(not(target_os = "macos"))]
@@ -134,7 +169,10 @@ pub(crate) fn log_line(msg: &str) {
     {
         let p = log_path();
         let _ = fs::create_dir_all(log_dir());
-        if fs::metadata(&p).map(|m| m.len() > 64 * 1024).unwrap_or(false) {
+        if fs::metadata(&p)
+            .map(|m| m.len() > 64 * 1024)
+            .unwrap_or(false)
+        {
             let _ = fs::remove_file(&p);
         }
         if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(p) {
@@ -148,6 +186,25 @@ pub(crate) fn log_line(msg: &str) {
     #[cfg(not(debug_assertions))]
     {
         let _ = msg;
+    }
+}
+
+/// Operational recovery events are retained in release builds, without client log contents.
+pub fn log_event(msg: &str) {
+    let dir = super::config::directory();
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("network-events.log");
+    if fs::metadata(&path).is_ok_and(|m| m.len() > 256 * 1024) {
+        let _ = fs::rename(&path, dir.join("network-events.previous.log"));
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = super::config::inherit_directory_owner(&path);
+        let _ = writeln!(
+            file,
+            "[{}] {}",
+            super::route_health::now_ms(),
+            msg.replace(['\r', '\n'], " ")
+        );
     }
 }
 
@@ -166,12 +223,15 @@ pub fn log_fatal(msg: &str) {
 pub fn run() -> Result<(), String> {
     let _ = load_if_index();
     let addr = format!("{}:{}", LISTEN_IP, LISTEN_PORT);
-    let socket = UdpSocket::bind(&addr).map_err(|e| format!("Не удалось занять {}: {}", addr, e))?;
+    let socket =
+        UdpSocket::bind(&addr).map_err(|e| format!("Не удалось занять {}: {}", addr, e))?;
+    let health = UdpSocket::bind((LISTEN_IP, HEALTH_PORT))
+        .map_err(|e| format!("Проверка готовности DNS: {e}"))?;
     let _ = crate::net::socket::set_socket_buffers(&socket, 512 * 1024);
     log_line(&format!("start {}", addr));
     resolvers::warmup(load_if_index());
-    #[cfg(not(target_os = "macos"))]
-    crate::net::rank::spawn_background();
+    crate::net::rank::spawn_background(true);
+    super::log_monitor::spawn_background();
     let sock_arc = Arc::new(socket);
 
     let (tx, rx) = mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>();
@@ -200,6 +260,21 @@ pub fn run() -> Result<(), String> {
             }
         });
     }
+
+    // Startup readiness must never wait for external DNS or queued TLS probes.
+    thread::spawn(move || {
+        let mut bytes = [0u8; 512];
+        while let Ok((n, peer)) = health.recv_from(&mut bytes) {
+            let query = &bytes[..n];
+            if question_name(query).as_deref() == Some(HEALTH_NAME) {
+                if let Some(reply) =
+                    crate::net::client::address_response(query, &[Ipv4Addr::LOCALHOST])
+                {
+                    let _ = health.send_to(&reply, peer);
+                }
+            }
+        }
+    });
 
     let mut buf = [0u8; 1500];
     let mut backoff_ms = 100;
@@ -232,6 +307,14 @@ fn relay(query: &[u8]) -> Option<Vec<u8>> {
     let if_index = load_if_index();
     match resolvers::resolve_best(query, if_index) {
         Some(hit) => {
+            if let Some(host) = question_name(query) {
+                for ip in super::client::answer_addrs(&hit.reply) {
+                    super::route_health::note_used(&super::route_health::Key::ip(
+                        &host,
+                        (ip, 443).into(),
+                    ));
+                }
+            }
             log_line(&format!(
                 "{:<12} {} [{}]",
                 resolvers::verdict_tag(hit.verdict),

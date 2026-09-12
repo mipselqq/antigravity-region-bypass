@@ -11,11 +11,14 @@ fn backup_path() -> PathBuf {
 fn wide(s: &str) -> Vec<u16> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 #[cfg(target_os = "windows")]
-fn read_dword(subkey: &str, name: &str) -> Option<u32> {
+fn read_dword(subkey: &str, name: &str) -> Result<Option<u32>, String> {
     const HKEY_LOCAL_MACHINE: usize = 0x80000002u32 as i32 as isize as usize;
     const KEY_READ: u32 = 0x20019;
     const REG_DWORD: u32 = 4;
@@ -42,8 +45,12 @@ fn read_dword(subkey: &str, name: &str) -> Option<u32> {
 
     let mut hkey: usize = 0;
     let sk = wide(subkey);
-    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sk.as_ptr(), 0, KEY_READ, &mut hkey) } != 0 {
-        return None;
+    let opened = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sk.as_ptr(), 0, KEY_READ, &mut hkey) };
+    if opened == 2 {
+        return Ok(None);
+    }
+    if opened != 0 {
+        return Err(format!("Чтение DoH registry: {opened}"));
     }
     let mut ty: u32 = 0;
     let mut val: u32 = 0;
@@ -60,10 +67,12 @@ fn read_dword(subkey: &str, name: &str) -> Option<u32> {
         )
     };
     unsafe { RegCloseKey(hkey) };
-    if ret == 0 && ty == REG_DWORD {
-        Some(val)
+    if ret == 2 {
+        Ok(None)
+    } else if ret == 0 && ty == REG_DWORD {
+        Ok(Some(val))
     } else {
-        None
+        Err(format!("Чтение {name}: код {ret}, тип {ty}"))
     }
 }
 
@@ -131,7 +140,7 @@ fn write_dword(subkey: &str, name: &str, value: u32) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn delete_value(subkey: &str, name: &str) {
+fn delete_value(subkey: &str, name: &str) -> Result<(), String> {
     const HKEY_LOCAL_MACHINE: usize = 0x80000002u32 as i32 as isize as usize;
     const KEY_SET_VALUE: u32 = 0x0002;
 
@@ -150,89 +159,137 @@ fn delete_value(subkey: &str, name: &str) {
 
     let mut hkey: usize = 0;
     let sk = wide(subkey);
-    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sk.as_ptr(), 0, KEY_SET_VALUE, &mut hkey) } == 0 {
-        let vn = wide(name);
-        unsafe { RegDeleteValueW(hkey, vn.as_ptr()) };
-        unsafe { RegCloseKey(hkey) };
+    let opened =
+        unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sk.as_ptr(), 0, KEY_SET_VALUE, &mut hkey) };
+    if opened == 2 {
+        return Ok(());
+    }
+    if opened != 0 {
+        return Err(format!("DoH delete open: {opened}"));
+    }
+    let result = unsafe { RegDeleteValueW(hkey, wide(name).as_ptr()) };
+    unsafe { RegCloseKey(hkey) };
+    if result == 0 || result == 2 {
+        Ok(())
+    } else {
+        Err(format!("DoH delete: {result}"))
     }
 }
 
 const DNSCACHE: &str = r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters";
 const DNSCLIENT: &str = r"SOFTWARE\Policies\Microsoft\Windows NT\DNSClient";
 
-pub fn disable_system_doh() {
+pub fn disable_system_doh() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        let prev_auto = read_dword(DNSCACHE, "EnableAutoDoh");
-        let prev_policy = read_dword(DNSCLIENT, "DoHPolicy");
+        let auto = read_dword(DNSCACHE, "EnableAutoDoh")?;
+        let policy = read_dword(DNSCLIENT, "DoHPolicy")?;
+        let encode = |n: Option<u32>| n.map(|v| v.to_string()).unwrap_or_else(|| "absent".into());
         let backup = format!(
-            "EnableAutoDoh={}\nDoHPolicy={}\n",
-            prev_auto.map(|v| v.to_string()).unwrap_or_else(|| "absent".into()),
-            prev_policy
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "absent".into())
+            "# antigravity-doh-v2\nEnableAutoDoh={}\nDoHPolicy={}\n",
+            encode(auto),
+            encode(policy)
         );
-        let dir = crate::net::relay::log_dir();
-        let _ = fs::create_dir_all(&dir);
+        fs::create_dir_all(crate::net::relay::log_dir()).map_err(|e| e.to_string())?;
         if !backup_path().exists() {
-            let _ = fs::write(backup_path(), backup);
+            crate::system::fs_utils::robust_write_file(&backup_path(), backup.as_bytes())?;
+        } else {
+            parse_backup(&fs::read_to_string(backup_path()).map_err(|e| e.to_string())?)?;
         }
-
-        // 0 = DoH off (Windows default is 2 = auto)
-        let _ = write_dword(DNSCACHE, "EnableAutoDoh", 0);
-        // 2 = Prohibit DoH (Windows 11 DNSClient policy)
-        let _ = write_dword(DNSCLIENT, "DoHPolicy", 2);
+        if !write_dword(DNSCACHE, "EnableAutoDoh", 0) || !write_dword(DNSCLIENT, "DoHPolicy", 1) {
+            return Err("DoH: не удалось записать политику; backup сохранён".into());
+        }
+        if read_dword(DNSCACHE, "EnableAutoDoh")? != Some(0)
+            || read_dword(DNSCLIENT, "DoHPolicy")? != Some(1)
+        {
+            return Err("DoH: политика не подтвердилась после записи".into());
+        }
     }
+    Ok(())
 }
 
-pub fn restore_system_doh() {
+fn parse_backup(text: &str) -> Result<[Option<u32>; 2], String> {
+    let mut values = Vec::new();
+    for key in ["EnableAutoDoh", "DoHPolicy"] {
+        let prefix = format!("{key}=");
+        let value = text
+            .lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .ok_or("Неполный DoH backup")?;
+        values.push(if value == "absent" {
+            None
+        } else {
+            Some(value.parse::<u32>().map_err(|_| "Повреждён DoH backup")?)
+        });
+    }
+    Ok([values[0], values[1]])
+}
+
+pub fn restore_system_doh() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         let p = backup_path();
-        let Ok(c) = fs::read_to_string(&p) else {
-            return;
-        };
-            let mut auto: Option<String> = None;
-            let mut policy: Option<String> = None;
-            for line in c.lines() {
-                if let Some(v) = line.strip_prefix("EnableAutoDoh=") {
-                    auto = Some(v.to_string());
-                }
-                if let Some(v) = line.strip_prefix("DoHPolicy=") {
-                    policy = Some(v.to_string());
-                }
+        if !p.exists() {
+            return Ok(());
+        }
+        let text = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+        let values = parse_backup(&text)?;
+        let legacy = !text.starts_with("# antigravity-doh-v2");
+        for ((path, key, applied), original) in
+            [(DNSCACHE, "EnableAutoDoh", 0), (DNSCLIENT, "DoHPolicy", 1)]
+                .into_iter()
+                .zip(values)
+        {
+            let current = read_dword(path, key)?;
+            if current != original
+                && current != Some(applied)
+                && !(legacy && key == "DoHPolicy" && current == Some(2))
+            {
+                return Err(format!(
+                    "{key} изменён после настройки; backup сохранён, откат отменён"
+                ));
             }
-            match auto.as_deref() {
-                Some("absent") | None => delete_value(DNSCACHE, "EnableAutoDoh"),
-                Some(v) => {
-                    if let Ok(n) = v.parse::<u32>() {
-                        let _ = write_dword(DNSCACHE, "EnableAutoDoh", n);
+        }
+        for ((path, key), value) in [(DNSCACHE, "EnableAutoDoh"), (DNSCLIENT, "DoHPolicy")]
+            .into_iter()
+            .zip(values)
+        {
+            match value {
+                None => delete_value(path, key)?,
+                Some(n) => {
+                    if !write_dword(path, key, n) {
+                        return Err(format!("Не восстановлен {key}; backup сохранён"));
                     }
                 }
             }
-            match policy.as_deref() {
-                Some("absent") | None => delete_value(DNSCLIENT, "DoHPolicy"),
-                Some(v) => {
-                    if let Ok(n) = v.parse::<u32>() {
-                        let _ = write_dword(DNSCLIENT, "DoHPolicy", n);
-                    }
-                }
+            if read_dword(path, key)? != value {
+                return Err(format!("Проверка восстановления {key} не пройдена"));
             }
-            let _ = fs::remove_file(p);
+        }
+        fs::remove_file(p).map_err(|e| e.to_string())?;
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = backup_path();
-    }
+    Ok(())
 }
 
 pub fn is_doh_disabled() -> bool {
     #[cfg(target_os = "windows")]
     {
-        let auto = read_dword(DNSCACHE, "EnableAutoDoh").unwrap_or(2);
-        let policy = read_dword(DNSCLIENT, "DoHPolicy");
-        auto == 0 || policy == Some(2)
+        matches!(read_dword(DNSCLIENT, "DoHPolicy"), Ok(Some(1)))
     }
     #[cfg(not(target_os = "windows"))]
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn backup_distinguishes_absent_from_zero_and_rejects_damage() {
+        assert_eq!(
+            parse_backup("EnableAutoDoh=absent\nDoHPolicy=0\n").unwrap(),
+            [None, Some(0)]
+        );
+        assert!(parse_backup("DoHPolicy=2").is_err());
+        assert!(parse_backup("EnableAutoDoh=oops\nDoHPolicy=1").is_err());
+    }
 }
