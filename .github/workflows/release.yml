@@ -52,6 +52,9 @@ jobs:
       - name: Launcher compatibility
         run: python tests/verify_wrappers.py
 
+      - name: Standalone macOS launcher packaging
+        run: python tests/verify_macos_bundle.py
+
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -83,12 +86,17 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Bundle macOS engines into one launcher
+        run: python3 scripts/bundle_macos_launcher.py --arm64 dist/antigravity-bypass-russia-macos-arm64 --x64 dist/antigravity-bypass-russia-macos-x64 --output dist/unlock_and_restore.sh
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            dist/*
+            dist/antigravity-bypass-russia.exe
+            dist/unlock_and_restore.ps1
+            dist/unlock_and_restore.sh
           body_path: RELEASE_NOTES_1.3.0.md
           draft: true
           generate_release_notes: false
