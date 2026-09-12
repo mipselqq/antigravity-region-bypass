@@ -130,3 +130,8 @@ route-health.lock
 tcp_backup.conf
 doh_backup.conf
 custom_upstream_proxy.conf
+
+# Local project and testing notes
+/PROJECT.md
+/TEST_INFRA.md
+/TEST_READY.md
