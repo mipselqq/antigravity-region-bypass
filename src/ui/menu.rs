@@ -38,7 +38,7 @@ mod setup_tests {
     #[test]
     fn cancelled_or_blocked_file_setup_skips_all_following_mutations() {
         let outcome = continue_setup(FileSetupOutcome::Stopped, || {
-            panic!("Cancelled setup must not clear caches or change endpoints")
+            panic!("Cancelled setup must not change endpoints")
         });
         let outcome = continue_setup(outcome, || {
             panic!("Cancelled setup must not configure DNS or install a service")
@@ -52,9 +52,9 @@ mod setup_tests {
         for files_ok in [false, true] {
             for side_ok in [false, true] {
                 for network_ok in [false, true] {
-                    let mut stages = vec!["patch files"];
+                    let mut stages = vec!["patch files and clear caches"];
                     let outcome = continue_setup(FileSetupOutcome::Completed(files_ok), || {
-                        stages.push("clear caches and configure endpoints");
+                        stages.push("configure endpoints");
                         side_ok
                     });
                     let outcome = continue_setup(outcome, || {
@@ -64,8 +64,8 @@ mod setup_tests {
                     assert_eq!(
                         stages,
                         [
-                            "patch files",
-                            "clear caches and configure endpoints",
+                            "patch files and clear caches",
+                            "configure endpoints",
                             "configure DNS and refresh endpoints"
                         ]
                     );
@@ -140,10 +140,14 @@ fn patch_targets(targets: Vec<FoundTarget>) -> FileSetupOutcome {
     for t in targets {
         ok &= print_patch_result(&t, patch_target(&t));
     }
+    // Successful JS patches need cache invalidation even when another file failed.
+    if let Err(error) = clear_ide_v8_caches() {
+        operation_error("Не удалось очистить кэш приложения", &error);
+        ok = false;
+    }
     FileSetupOutcome::Completed(ok)
 }
 fn apply_files_side() -> bool {
-    let _ = clear_ide_v8_caches();
     let mut ok = true;
     for note in crate::core::endpoint::apply_all() {
         match note {
@@ -170,7 +174,6 @@ fn patch_installations() -> FileSetupOutcome {
         eprintln!("[✗] Файлы приложения не найдены; укажите путь в пункте 4.");
         return FileSetupOutcome::Stopped;
     }
-    // Successful JS patches need their old V8 caches cleared even if another file failed.
     continue_setup(patch_targets(targets), apply_files_side)
 }
 fn show_result(ok: bool) {
@@ -366,6 +369,12 @@ pub fn handle_rollback() -> bool {
         }
         for target in targets {
             ok &= print_patch_result(&target, restore_target(&target));
+        }
+    }
+    if !paths.is_empty() {
+        if let Err(error) = clear_ide_v8_caches() {
+            operation_error("Не удалось очистить кэш приложения", &error);
+            ok = false;
         }
     }
     for e in crate::core::endpoint::remove_all() {

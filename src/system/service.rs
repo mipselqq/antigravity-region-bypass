@@ -118,28 +118,39 @@ mod windows_tests {
 
     #[test]
     fn task_query_distinguishes_absence_from_scheduler_failure() {
-        for (body, expected) in [
-            ("return @()", Some(false)),
+        use std::os::windows::process::ExitStatusExt;
+        for (text, code, expected) in [
+            ("", 0, Some(false)),
             (
-                "[pscustomobject]@{TaskPath='\\other\\';TaskName='AntigravityBypassRussia'}",
+                "\"\\other\\AntigravityBypassRussia\",\"N/A\",\"Ready\"",
+                0,
                 Some(false),
             ),
             (
-                "[pscustomobject]@{TaskPath='\\';TaskName='AntigravityBypassRussia'}",
+                "\"\\AntigravityBypassRussia,other\",\"N/A\",\"Ready\"",
+                0,
+                Some(false),
+            ),
+            (
+                "\"\\AntigravityBypassRussia\",\"Н/Д\",\"Выполняется\"",
+                0,
                 Some(true),
             ),
-            ("throw 'Служба планировщика недоступна'", None),
+            (
+                "\"\\ANTIGRAVITYBYPASSRUSSIA\",\"N/A\",\"Ready\"",
+                0,
+                Some(true),
+            ),
+            ("\"\\AntigravityBypassRussia\",\"N/A\",\"Ready\"", 1, None),
         ] {
-            let script = format!(
-                "function Get-ScheduledTask {{ {body} }}\n{}",
-                registered_query()
-            );
-            let result = registered_response(crate::system::powershell::output(&script).unwrap());
+            let result = registered_response(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code),
+                stdout: text.as_bytes().to_vec(),
+                stderr: b"scheduler query failed".to_vec(),
+            });
             match expected {
                 Some(value) => assert_eq!(result.unwrap(), value),
-                None => assert!(result
-                    .unwrap_err()
-                    .contains("Служба планировщика недоступна")),
+                None => assert!(result.unwrap_err().contains("scheduler query failed")),
             }
         }
     }
@@ -180,23 +191,6 @@ fn xml_text(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn registered_query() -> String {
-    format!(
-        r#"
-[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)
-$ErrorActionPreference='Stop'
-try {{
-    $tasks = @(Get-ScheduledTask | Where-Object {{ $_.TaskPath -eq '\' -and $_.TaskName -eq '{TASK_NAME}' }})
-    ConvertTo-Json -Compress -InputObject ($tasks.Count -gt 0)
-}} catch {{
-    [Console]::Error.WriteLine($_.Exception.Message)
-    exit 1
-}}
-"#
-    )
-}
-
-#[cfg(windows)]
 fn registered_response(output: std::process::Output) -> Result<bool, String> {
     if !output.status.success() {
         return Err(format!(
@@ -204,15 +198,23 @@ fn registered_response(output: std::process::Output) -> Result<bool, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Некорректный ответ при проверке DNS-службы: {e}"))
+    // /FO CSV /NH always puts the full task path in the first quoted field.
+    // Match the complete root task, including its closing quote and delimiter;
+    // localized status/date fields and similarly named tasks are irrelevant.
+    let prefix = format!("\"\\{TASK_NAME}\",");
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.trim_start()
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    }))
 }
 
 pub fn registered_state() -> Result<bool, String> {
     #[cfg(windows)]
     {
         registered_response(
-            crate::system::powershell::output(&registered_query())
+            crate::system::command::output("schtasks", ["/Query", "/FO", "CSV", "/NH"])
                 .map_err(|e| format!("Проверка задачи DNS-службы: {e}"))?,
         )
     }
@@ -336,6 +338,118 @@ fn windows_task_xml(dst: &Path) -> String {
     )
 }
 
+// Prepare the complete replacement beside the destination before stopping the
+// service. Closing the temporary file also permits Windows to rename it later.
+fn prepare_service_binary(src: &Path, dst: &Path) -> Result<tempfile::TempPath, String> {
+    let prepare = || -> std::io::Result<tempfile::TempPath> {
+        let mut source = File::open(src)?;
+        let parent = dst.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Нет каталога службы")
+        })?;
+        let mut staged = tempfile::Builder::new()
+            .prefix("ag_dns-update-")
+            .tempfile_in(parent)?;
+        std::io::copy(&mut source, staged.as_file_mut())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            staged
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode(0o755))?;
+        }
+        staged.as_file().sync_all()?;
+        Ok(staged.into_temp_path())
+    };
+    prepare().map_err(|e| format!("Не удалось подготовить обновление DNS-службы: {e}"))
+}
+
+fn finish_prepared_service_binary(staged: &Path) -> Result<(), String> {
+    crate::system::fs_utils::post_write_hook(staged)?;
+    // FlushFileBuffers on Windows requires a writable handle.
+    File::options()
+        .write(true)
+        .open(staged)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("Не удалось сохранить обновление DNS-службы: {e}"))
+}
+
+#[cfg(test)]
+mod binary_update_tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_service_signature_remains_valid_after_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let dst = temp.path().join(EXE_NAME);
+        let staged = prepare_service_binary(&std::env::current_exe().unwrap(), &dst).unwrap();
+        finish_prepared_service_binary(&staged).unwrap();
+        fs::rename(&staged, &dst).unwrap();
+        let verified = crate::system::command::output(
+            "codesign",
+            [
+                std::ffi::OsStr::new("--verify"),
+                std::ffi::OsStr::new("--strict"),
+                dst.as_os_str(),
+            ],
+        )
+        .unwrap();
+        assert!(verified.status.success(), "{verified:?}");
+    }
+
+    #[test]
+    fn failed_preparation_preserves_installed_binary_and_leaves_no_partial_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let dst = temp.path().join(EXE_NAME);
+        fs::write(&dst, b"old service").unwrap();
+        assert!(prepare_service_binary(&temp.path().join("missing"), &dst).is_err());
+        // A directory can open on Unix but cannot be copied as a file.
+        assert!(prepare_service_binary(temp.path(), &dst).is_err());
+        assert_eq!(fs::read(&dst).unwrap(), b"old service");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn replacement_is_staged_beside_destination_and_preserves_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("new binary");
+        let dst = temp.path().join(EXE_NAME);
+        fs::write(&src, b"new service").unwrap();
+        fs::write(&dst, b"old service").unwrap();
+        let staged = prepare_service_binary(&src, &dst).unwrap();
+        #[cfg(windows)]
+        finish_prepared_service_binary(&staged).unwrap();
+        assert_eq!(staged.parent(), dst.parent());
+        assert_eq!(fs::read(&dst).unwrap(), b"old service");
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let locked = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&dst)
+                .unwrap();
+            assert!(fs::rename(&staged, &dst).is_err());
+            assert_eq!(fs::read(&dst).unwrap(), b"old service");
+            assert_eq!(fs::read(&staged).unwrap(), b"new service");
+            drop(locked);
+        }
+        fs::rename(&staged, &dst).unwrap();
+        drop(staged);
+        assert_eq!(fs::read(&dst).unwrap(), b"new service");
+        assert_eq!(fs::read(&src).unwrap(), b"new service");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+    }
+}
+
 pub fn enable() -> Result<(), String> {
     let dir = install_dir();
     fs::create_dir_all(&dir).map_err(|e| {
@@ -351,6 +465,8 @@ pub fn enable() -> Result<(), String> {
     let dst = installed_exe();
 
     if !dst.exists() || !same_file_bytes(&src, &dst) {
+        let staged = prepare_service_binary(&src, &dst)?;
+        finish_prepared_service_binary(&staged)?;
         #[cfg(target_os = "windows")]
         {
             let _ = crate::system::command::output("schtasks", ["/End", "/TN", TASK_NAME]);
@@ -366,8 +482,9 @@ pub fn enable() -> Result<(), String> {
         let mut copy_res = Err(std::io::Error::new(std::io::ErrorKind::Other, "init"));
         for attempt in 0..20 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let _ = fs::remove_file(&dst);
-            copy_res = fs::copy(&src, &dst);
+            // Rename on the same filesystem replaces the old binary atomically.
+            // A failed attempt keeps both the old binary and the staged copy.
+            copy_res = fs::rename(&staged, &dst);
             if copy_res.is_ok() {
                 break;
             }
@@ -384,19 +501,12 @@ pub fn enable() -> Result<(), String> {
 
         copy_res.map_err(|e| {
             format!(
-                "Не удалось скопировать бинарник службы ({} -> {}): {}",
+                "Не удалось заменить бинарник службы ({} -> {}): {}",
                 src.display(),
                 dst.display(),
                 e
             )
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dst, fs::Permissions::from_mode(0o755))
-                .map_err(|e| e.to_string())?;
-        }
-        crate::system::fs_utils::post_write_hook(&dst)?;
     }
 
     #[cfg(target_os = "windows")]
