@@ -30,7 +30,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 time = "0.3"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Foundation", "Win32_System_Registry", "Win32_System_RestartManager", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Foundation", "Win32_System_Registry", "Win32_System_RestartManager", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = { version = "0.1", default-features = false }

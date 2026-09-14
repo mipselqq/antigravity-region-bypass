@@ -2,7 +2,11 @@
 use super::*;
 use std::process::{Command, Stdio};
 
-fn command(program: &str, args: &[&str], budget: Duration) -> Result<String, &'static str> {
+fn command(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    budget: Duration,
+) -> Result<String, &'static str> {
     // A temporary output file avoids pipe deadlocks and inheriting a live reader on timeout.
     let mut output = tempfile::tempfile().map_err(|_| "temporary_file_failed")?;
     let mut child = system::process::no_window(&mut Command::new(program))
@@ -41,7 +45,7 @@ fn command(program: &str, args: &[&str], budget: Duration) -> Result<String, &'s
 fn powershell(script: &str) -> Result<Value, &'static str> {
     let script = format!("[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; {script}");
     let text = command(
-        "powershell.exe",
+        system::powershell::executable().map_err(|_| "command_unavailable")?,
         &["-NoProfile", "-NonInteractive", "-Command", &script],
         Duration::from_secs(10),
     )?;

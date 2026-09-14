@@ -3,6 +3,8 @@ pub mod file_lock;
 pub mod fs_utils;
 pub mod journal;
 pub mod lock;
+#[cfg(windows)]
+pub mod powershell;
 pub mod privilege;
 pub mod process;
 pub mod service;

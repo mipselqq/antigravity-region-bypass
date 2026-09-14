@@ -1,4 +1,4 @@
-use crate::system::process::no_window;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 pub struct Egress {
@@ -42,20 +42,7 @@ fn descr_is_vpn(descr: &str) -> bool {
 pub fn ensure_tun_disabled() -> Result<(), String> {
     #[cfg(windows)]
     {
-        let script = r#"$ErrorActionPreference='Stop'; ConvertTo-Json -Compress -InputObject @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and -not $_.HardwareInterface } | ForEach-Object { $_.Name + '|' + $_.InterfaceDescription })"#;
-        let output = no_window(&mut Command::new("powershell.exe"))
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .output()
-            .map_err(|e| format!("Не удалось проверить режим TUN: {e}"))?;
-        if !output.status.success() {
-            return Err("Не удалось проверить сетевые адаптеры. Выключите VPN и режим TUN и повторите запуск.".into());
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        let adapters: Vec<String> = if text.trim().is_empty() {
-            vec![]
-        } else {
-            serde_json::from_str(&text).map_err(|e| format!("Проверка TUN: {e}"))?
-        };
+        let adapters = active_virtual_adapters()?;
         if adapters.iter().any(|name| is_active_tun_name(name)) {
             return Err("Обнаружен включённый TUN. Выключите VPN и режим TUN в VPN-клиенте, затем повторите включение обхода.".into());
         }
@@ -72,6 +59,49 @@ pub fn ensure_tun_disabled() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+const TUN_ADAPTER_QUERY: &str = r#"
+[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)
+$ErrorActionPreference='Stop'
+try {
+    ConvertTo-Json -Compress -InputObject @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and -not $_.HardwareInterface } | ForEach-Object { $_.Name + '|' + $_.InterfaceDescription })
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+"#;
+
+#[cfg(windows)]
+fn active_virtual_adapters() -> Result<Vec<String>, String> {
+    let output = crate::system::powershell::command()
+        .and_then(|mut cmd| {
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                TUN_ADAPTER_QUERY,
+            ])
+            .output()
+        })
+        .map_err(|e| format!("Не удалось запустить Windows PowerShell для проверки TUN: {e}"))?;
+    parse_tun_adapters(output)
+}
+
+#[cfg(windows)]
+fn parse_tun_adapters(output: std::process::Output) -> Result<Vec<String>, String> {
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Не удалось проверить сетевые адаптеры через Windows PowerShell ({}): {}",
+            output.status,
+            detail.trim()
+        ));
+    }
+    // A failed or empty query is not evidence that TUN is disabled.
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Некорректный ответ Windows PowerShell при проверке TUN: {e}"))
 }
 
 #[cfg(any(windows, test))]
@@ -124,6 +154,120 @@ mod tun_preflight_tests {
             "vEthernet|Hyper-V Virtual Ethernet Adapter",
         ] {
             assert!(!super::is_active_tun_name(name), "{name}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn queries_adapters_without_path_and_ignores_shadow_powershell() {
+        use crate::system::{powershell, process::no_window};
+        use std::{
+            process::Command,
+            time::{Duration, Instant},
+        };
+
+        const CHILD: &str = "ABR_TEST_POWERSHELL_ENVIRONMENT";
+        if let Ok(mode) = std::env::var(CHILD) {
+            if mode != "shadow" {
+                // Reproduce issue #6 in an isolated process. Setting PATH on
+                // only the PowerShell child leaves Rust's parent-PATH fallback.
+                let error = no_window(&mut Command::new("powershell.exe"))
+                    .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
+                    .output()
+                    .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                assert_eq!(error.to_string(), "program not found");
+            }
+            let executable = powershell::executable().unwrap();
+            assert!(executable.is_absolute());
+            assert!(!executable.starts_with(std::env::current_dir().unwrap()));
+            // Actual read-only NetAdapter query, without patching or binding DNS.
+            super::active_virtual_adapters().unwrap();
+            return;
+        }
+
+        for mode in ["empty", "unset", "shadow"] {
+            let directory = tempfile::Builder::new()
+                .prefix("tun query путь ")
+                .tempdir()
+                .unwrap();
+            if mode == "shadow" {
+                std::fs::write(
+                    directory.path().join("powershell.exe"),
+                    b"not an executable",
+                )
+                .unwrap();
+            }
+            let mut cmd = Command::new(std::env::current_exe().unwrap());
+            no_window(&mut cmd);
+            cmd.args(["--exact", "net::egress::tun_preflight_tests::queries_adapters_without_path_and_ignores_shadow_powershell", "--nocapture"])
+                .env(CHILD, mode).current_dir(directory.path());
+            match mode {
+                "unset" => {
+                    cmd.env_remove("PATH");
+                }
+                "shadow" => {
+                    cmd.env("PATH", directory.path());
+                }
+                _ => {
+                    cmd.env("PATH", "");
+                }
+            }
+            let mut child = cmd.spawn().unwrap();
+            let started = Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "{mode}: {status}");
+                    break;
+                }
+                if started.elapsed() > Duration::from_secs(30) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{mode}: adapter query timed out");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn adapter_query_handles_empty_lists_unicode_and_query_failures() {
+        fn query(body: &str) -> Result<Vec<String>, String> {
+            let script = format!(
+                "function Get-NetAdapter {{ {body} }}\n{}",
+                super::TUN_ADAPTER_QUERY
+            );
+            let output = crate::system::powershell::command()
+                .unwrap()
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+                .unwrap();
+            super::parse_tun_adapters(output)
+        }
+        assert!(query("return @()").unwrap().is_empty());
+        assert_eq!(query("[pscustomobject]@{Name='Сеть';InterfaceDescription='Wintun';Status='Up';HardwareInterface=$false}").unwrap(), ["Сеть|Wintun"]);
+        assert_eq!(query(r#"
+            [pscustomobject]@{Name='Ethernet';InterfaceDescription='Realtek';Status='Up';HardwareInterface=$true}
+            [pscustomobject]@{Name='VPN';InterfaceDescription='Wintun';Status='Disconnected';HardwareInterface=$false}
+            [pscustomobject]@{Name='Сеть';InterfaceDescription='WireGuard';Status='Up';HardwareInterface=$false}
+            [pscustomobject]@{Name='throne-tun';InterfaceDescription='sing-tun';Status='Up';HardwareInterface=$false}
+        "#).unwrap(), ["Сеть|WireGuard", "throne-tun|sing-tun"]);
+        let error = query("throw 'Ошибка службы адаптеров'").unwrap_err();
+        assert!(error.contains("Ошибка службы адаптеров"), "{error}");
+        assert!(!error.contains("Выключите VPN"), "{error}");
+        for response in ["", "not json"] {
+            let output = crate::system::powershell::command()
+                .unwrap()
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!("Write-Output '{response}'"),
+                ])
+                .output()
+                .unwrap();
+            assert!(super::parse_tun_adapters(output).is_err());
         }
     }
 }
@@ -256,7 +400,8 @@ if ($mine.Count -gt 0) {
     Write-Output ("{0}|{1}" -f $best.ifIndex, $best.NextHop)
 }
 "#;
-        let out = no_window(&mut Command::new("powershell"))
+        let out = crate::system::powershell::command()
+            .ok()?
             .args(["-NoProfile", "-NonInteractive", "-Command", ps])
             .output()
             .ok()?;

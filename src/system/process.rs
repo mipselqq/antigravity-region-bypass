@@ -92,7 +92,8 @@ pub fn ancestor_pids(processes: &[RunningProcess], current: u32) -> std::collect
 mod shutdown_tests {
     fn query_only_child() -> (super::Handle, std::process::Child) {
         use windows_sys::Win32::System::Threading::*;
-        let child = super::no_window(&mut std::process::Command::new("powershell.exe"))
+        let child = crate::system::powershell::command()
+            .unwrap()
             .args([
                 "-NoProfile",
                 "-NonInteractive",

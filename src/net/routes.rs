@@ -29,7 +29,8 @@ fn powershell(script: &str) -> Result<String, String> {
     let script = format!(
         "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; try {{ & {{ {script} }}; exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}"
     );
-    let out = crate::system::process::no_window(&mut std::process::Command::new("powershell.exe"))
+    let out = crate::system::powershell::command()
+        .map_err(|e| e.to_string())?
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .map_err(|e| e.to_string())?;

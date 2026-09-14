@@ -1,10 +1,6 @@
 #![allow(dead_code)]
 
 use crate::net::provider::NRPT_TAG;
-#[allow(unused_imports)]
-use crate::system::process::no_window;
-#[allow(unused_imports)]
-use std::process::Command;
 
 pub fn get_nrpt_status_info() -> (usize, Option<String>, bool) {
     #[cfg(target_os = "windows")]
@@ -844,7 +840,8 @@ try {{
 #[cfg(target_os = "windows")]
 pub fn verify_effective(rules: &[(String, String)]) -> Result<(), String> {
     let script = effective_check_script(rules)?;
-    let out = no_window(&mut Command::new("powershell.exe"))
+    let out = crate::system::powershell::command()
+        .map_err(|e| e.to_string())?
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .map_err(|e| e.to_string())?;
@@ -871,7 +868,7 @@ mod tests {
             ("@()", false),
         ] {
             let fixture = format!("function Get-DnsClientNrptPolicy {{ [pscustomobject]@{{ Namespace=@('example.test'); NameServers={servers} }} }}\n{check}");
-            let out = no_window(&mut Command::new("powershell.exe")).args(["-NoProfile", "-NonInteractive", "-Command", &fixture]).output().unwrap();
+            let out = crate::system::powershell::command().unwrap().args(["-NoProfile", "-NonInteractive", "-Command", &fixture]).output().unwrap();
             assert_eq!(out.status.success(), success, "{}", String::from_utf8_lossy(&out.stderr));
         }
     }
@@ -884,7 +881,8 @@ mod tests {
         .unwrap();
         for (second, success) in [("127.0.0.53", true), ("8.8.8.8", false)] {
             let script = format!("function Get-DnsClientNrptPolicy {{ [pscustomobject]@{{Namespace=@('one.test');NameServers=[System.Net.IPAddress]::Parse('127.0.0.53')}}; [pscustomobject]@{{Namespace=@('two.test');NameServers='{second}'}} }}\n{check}");
-            let out = no_window(&mut Command::new("powershell.exe"))
+            let out = crate::system::powershell::command()
+                .unwrap()
                 .args(["-NoProfile", "-NonInteractive", "-Command", &script])
                 .output()
                 .unwrap();
@@ -902,7 +900,8 @@ mod tests {
             effective_check_script(&[("example.test".into(), "127.0.0.53".into())]).unwrap();
         for body in ["throw 'Ошибка проверки сети'", "return @()"] {
             let script = format!("function Get-DnsClientNrptPolicy {{ {body} }}\n{check}");
-            let out = no_window(&mut Command::new("powershell.exe"))
+            let out = crate::system::powershell::command()
+                .unwrap()
                 .args(["-NoProfile", "-NonInteractive", "-Command", &script])
                 .output()
                 .unwrap();
