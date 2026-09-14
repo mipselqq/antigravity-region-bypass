@@ -577,19 +577,23 @@ mod tests {
 
     #[test]
     fn stalled_check_preserves_completed_sections() {
+        // Keep the slow collector blocked until after the deadline, even when CI
+        // pauses this thread between spawning collectors and starting the budget.
+        let (release, blocked) = mpsc::channel::<()>();
         let result = bounded_jobs(
             vec![
                 ("fast".into(), Box::new(|| json!(42))),
                 (
                     "stalled".into(),
-                    Box::new(|| {
-                        std::thread::sleep(Duration::from_millis(150));
+                    Box::new(move || {
+                        let _ = blocked.recv();
                         json!(1)
                     }),
                 ),
             ],
-            Duration::from_millis(50),
+            Duration::from_secs(2),
         );
+        drop(release);
         assert_eq!(result["fast"], 42);
         assert_eq!(result["stalled"]["status"], "timeout");
     }
