@@ -119,6 +119,12 @@ fn plan_binary(data: &[u8], kind: TargetKind) -> Result<Plan, String> {
             CLI_GATE_X64_LONG_FIX,
             "agy-x64-long-v1",
         ),
+        (TargetKind::AgyCli, Architecture::Aarch64) => (
+            regex_mgr_arm64_orig(),
+            regex_mgr_arm64_patched(),
+            MGR_GATE_ARM64_FIX,
+            "agy-arm64-v1",
+        ),
         _ => return Err("Нет профиля патча для этой архитектуры/компонента".into()),
     };
     let mut output = data.to_vec();

@@ -121,11 +121,7 @@ pub fn handle_unlock_all() -> bool {
     if !check_vpn_before_setup() {
         return false;
     }
-    if !patch_installations() {
-        show_result(false);
-        pause();
-        return false;
-    }
+    let files_ok = patch_installations();
     let mut ok = true;
     match apply_dns_rules() {
         Ok(msg) => {
@@ -146,9 +142,9 @@ pub fn handle_unlock_all() -> bool {
             ok = false;
         }
     }
-    show_result(ok);
+    show_result(ok && files_ok);
     pause();
-    ok
+    ok && files_ok
 }
 pub fn handle_patch_files_only() -> bool {
     let ok = if let Some(path) = std::env::args().nth(2) {
