@@ -1,4 +1,5 @@
 mod core;
+mod diagnostics;
 mod net;
 mod system;
 mod ui;
@@ -15,6 +16,7 @@ fn print_help() {
           dns           Настройка SmartDNS / NRPT обхода\n\
           tune          Оптимизация сетевого стека TCP (Window Auto-Tuning, 512KB)\n\
           diagnostics   DNS, проверка TLS/сертификата и HTTP (без входа в аккаунт)\n\
+          report        Сохранить диагностику в JSON [необязательный каталог]\n\
           rollback      Отключить обход и восстановить сохранённые настройки\n\
           status        Отображение текущего статуса системы и выход\n\n\
         Опции:\n\
@@ -48,6 +50,7 @@ fn main() {
         command,
         "" | "status"
             | "diagnostics"
+            | "report"
             | "unlock"
             | "patch-files"
             | "dns"
@@ -60,7 +63,7 @@ fn main() {
         std::process::exit(2);
     }
     if args.len()
-        > if matches!(command, "patch-files" | "rollback" | "restore") {
+        > if matches!(command, "patch-files" | "rollback" | "restore" | "report") {
             3
         } else {
             2
@@ -75,6 +78,11 @@ fn main() {
     }
     if command == "diagnostics" {
         let ok = ui::menu::handle_diagnostics();
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    if command == "report" {
+        let directory = args.get(2).map(std::path::Path::new);
+        let ok = ui::menu::handle_save_diagnostics(directory);
         std::process::exit(if ok { 0 } else { 1 });
     }
     system::ensure_admin();

@@ -443,11 +443,6 @@ pub fn handle_diagnostics() -> bool {
     for report in &reports {
         crate::net::relay::log_event(&format!("Диагностика: {report:?}"));
     }
-    crate::net::relay::log_event(&format!(
-        "DNS servers: {:?}; config: {:?}",
-        crate::net::relay::load_upstream_servers(),
-        crate::net::config::load()
-    ));
     #[cfg(windows)]
     crate::net::relay::log_event(&format!(
         "System DoH disabled: {}",
@@ -459,6 +454,26 @@ pub fn handle_diagnostics() -> bool {
     if !ok {
         print_error_details();
     }
+    pause();
+    ok
+}
+
+pub fn handle_save_diagnostics(directory: Option<&std::path::Path>) -> bool {
+    println!("\n  Собираем диагностику подключения и приложения…");
+    println!("  Отчёт сохраняется локально; тексты переписок и токены не включаются.");
+    let ok = match crate::diagnostics::save(directory) {
+        Ok(path) => {
+            println!("\n  Диагностика сохранена: {}", path.display());
+            println!("  Этот JSON-файл можно приложить к Issue.");
+            println!("  Он содержит IP серверов и локальных шлюзов. Ничего не отправляется автоматически.");
+            println!("  Доступ к модели проверьте отдельным запросом в Antigravity.");
+            true
+        }
+        Err(error) => {
+            eprintln!("  Не удалось сохранить диагностику: {error}");
+            false
+        }
+    };
     pause();
     ok
 }
@@ -475,9 +490,10 @@ pub fn run_app() {
         println!("  [4]  Указать папку Antigravity");
         println!("  \x1b[96m[5]\x1b[0m  Проверить подключение");
         println!("  \x1b[91m[6]\x1b[0m  Отключить обход");
+        println!("  [7]  Сохранить диагностику");
         println!("\n  [0]  Выход\n");
 
-        match prompt("Выберите действие [0-6]: ").as_str() {
+        match prompt("Выберите действие [0-7]: ").as_str() {
             "1" => {
                 handle_unlock_all();
             }
@@ -493,6 +509,9 @@ pub fn run_app() {
             }
             "6" => {
                 handle_rollback();
+            }
+            "7" => {
+                handle_save_diagnostics(None);
             }
             "0" => {
                 clear_screen();

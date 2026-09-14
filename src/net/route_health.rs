@@ -100,6 +100,30 @@ impl Default for State {
     }
 }
 impl State {
+    /// Export only typed route metadata for the supported hosts, never event IDs or raw input.
+    pub fn diagnostic_snapshot(&self, now: u64) -> serde_json::Value {
+        let entries: Vec<_> = self
+            .entries
+            .values()
+            .filter_map(|e| {
+                if !super::provider::NRPT_AGENT.contains(&e.host.as_str()) {
+                    return None;
+                }
+                let address = e.route.parse::<SocketAddr>().ok()?;
+                Some(serde_json::json!({
+                    "host": e.host, "address": address, "latency_ms": e.latency_ms,
+                    "checked_ms": e.checked_ms, "transport_ok": e.ok,
+                    "failures": e.failures, "retry_ms": e.retry_ms,
+                    "region_until_ms": e.region_until_ms, "blocked_now": e.blocked(now)
+                }))
+            })
+            .collect();
+        let refused: Vec<_> = super::provider::NRPT_AGENT.iter().map(|host| {
+            serde_json::json!({"host": host, "recent_region_refusal": self.host_refused(host, now)})
+        }).collect();
+        serde_json::json!({"revision": self.revision, "entries": entries, "hosts": refused})
+    }
+
     pub fn invalidate_probes(&mut self) {
         for entry in self.entries.values_mut() {
             entry.checked_ms = 0;
