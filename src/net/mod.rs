@@ -5,9 +5,7 @@ pub mod doh;
 pub mod egress;
 pub mod health;
 pub mod hosts;
-pub mod log_monitor;
 pub mod nrpt;
-pub mod performance;
 pub mod provider;
 pub mod rank;
 pub mod relay;
@@ -29,8 +27,7 @@ use std::time::Duration;
 fn assemble_nameservers(via_relay: bool, substituters: &[&str]) -> String {
     let mut servers: Vec<String> = Vec::new();
     if via_relay {
-        // External NRPT nameservers would bypass DoH, route quarantine and TLS checks.
-        return LISTEN_IP.to_string();
+        servers.push(LISTEN_IP.to_string());
     }
     if substituters.is_empty() {
         for s in resolvers::fallback_v4() {
@@ -65,21 +62,22 @@ mod tests {
     }
 
     #[test]
-    fn active_relay_cannot_be_bypassed_by_external_nrpt_fallbacks() {
+    fn classic_mode_keeps_external_dns_fallbacks_alongside_the_relay() {
         assert_eq!(
             super::assemble_nameservers(true, &["1.2.3.4"]),
-            super::LISTEN_IP
+            format!("{};1.2.3.4", super::LISTEN_IP)
         );
         assert_eq!(super::assemble_nameservers(false, &["1.2.3.4"]), "1.2.3.4");
         assert_eq!(
             super::assemble_nameservers(false, &[]).split(';').count(),
-            7
+            3
         );
     }
 }
 
 pub fn preflight() -> Result<(), String> {
-    egress::ensure_tun_disabled()?;
+    // Version 2.0 uses physical routes and external DNS fallbacks with VPNs.
+    // Do not require a responsive loopback DNS port before configuring them.
     #[cfg(target_os = "macos")]
     split_dns::preflight(std::path::Path::new("/etc/resolver"), &nrpt_domains())?;
     Ok(())
@@ -115,7 +113,7 @@ pub(super) fn flush_dns_cache() -> Result<(), String> {
 
 pub struct NetworkSetup {
     pub message: String,
-    pub automatic_failover: bool,
+    pub local_relay_running: bool,
 }
 
 /// Serialize foreground setup and background OS/configuration writers. The DNS
@@ -249,7 +247,7 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
 
     let mut relay_ok = false;
     let mut relay_note = String::new();
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
         step("Запускаем DNS-обход");
         match crate::system::service::enable() {
@@ -264,6 +262,8 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    crate::system::service::disable()?;
     // Readiness is local; separately verify that the DNS data path answers.
     if relay_ok && !relay_answers() {
         relay_ok = false;
@@ -310,7 +310,7 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
     }
     Ok(NetworkSetup {
         message: msg,
-        automatic_failover: relay_ok,
+        local_relay_running: relay_ok,
     })
 }
 
@@ -388,16 +388,6 @@ fn remove_dns_configuration(restore_tcp: bool) -> Result<(), String> {
     let _configuration = configuration_lock()?;
     // Stop the background writer, but retain its directory and every backup.
     crate::system::service::disable()?;
-    match performance::load() {
-        Ok(mut comparison) => {
-            if comparison.preference.take().is_some() {
-                if let Err(error) = performance::save(&comparison) {
-                    errors.push(error);
-                }
-            }
-        }
-        Err(error) => relay::log_event(&format!("Результаты сравнения не прочитаны: {error}")),
-    }
     // Remove only the obsolete marker from the experimental TUN mode.
     let legacy_mode = relay::log_dir().join("hosts-mode");
     match std::fs::remove_file(legacy_mode) {

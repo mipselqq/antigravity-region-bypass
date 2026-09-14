@@ -11,11 +11,29 @@ case "$(uname -s):$(uname -m)" in
 esac
 # A downloaded engine beside this launcher takes precedence over old builds.
 if [[ -x "$script_dir/$release_name" ]]; then exec "$script_dir/$release_name" "$@"; fi
-if [[ -f "$repo_root/Cargo.toml" ]] && command -v cargo >/dev/null 2>&1; then
-  cargo build --release --locked --manifest-path "$repo_root/Cargo.toml"
+if [[ -f "$repo_root/Cargo.toml" ]]; then
+  # Older instructions used sudo. Build as the invoking user so rustup can find
+  # their toolchain and Cargo does not leave root-owned files in the checkout.
+  if [[ "$(id -u)" == 0 ]]; then
+    if [[ "${SUDO_UID:-}" =~ ^[1-9][0-9]*$ ]]; then
+      exec /usr/bin/sudo -H -u "#$SUDO_UID" -- /bin/bash "$script_dir/$(basename -- "${BASH_SOURCE[0]}")" "$@"
+    fi
+  else
+    cargo_bin="$(command -v cargo || true)"
+    if [[ -z "$cargo_bin" ]]; then
+      cargo_candidate="${CARGO_HOME:-${HOME:-}/.cargo}/bin/cargo"
+      if [[ -x "$cargo_candidate" ]]; then
+        cargo_bin="$cargo_candidate"
+        export PATH="$(cd -- "$(dirname -- "$cargo_bin")" && pwd):$PATH"
+      fi
+    fi
+    if [[ -n "$cargo_bin" ]]; then
+      "$cargo_bin" build --release --locked --manifest-path "$repo_root/Cargo.toml"
+    fi
+  fi
 fi
 for engine in "$repo_root/target/release/antigravity-bypass-russia" "$script_dir/$release_name" "$repo_root/$release_name"; do
   if [[ -x "$engine" ]]; then exec "$engine" "$@"; fi
 done
-printf '%s\n' 'Rust engine not found. Put the platform release binary beside this script, or install Rust and run from the repository without sudo.' >&2
+printf '%s\n' 'Rust engine not found. Use the macOS release launcher with its bundled engines, or install Rust and run this repository script without sudo. The engine requests administrator privileges when needed.' >&2
 exit 1

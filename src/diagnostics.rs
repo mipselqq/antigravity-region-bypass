@@ -127,9 +127,10 @@ fn config_summary(config: &net::config::Config) -> Value {
         })
         .collect();
     json!({"status": "ok", "doh": doh, "extra_udp": udp,
-        "watch_region_errors": config.watch_region_errors,
+        "mode": "classic-2.0",
+        "watch_region_errors": false,
         "log_root_count": config.log_roots.len(),
-        "supported_log_count": net::log_monitor::discover(&config.log_roots).len()})
+        "supported_log_count": 0})
 }
 
 fn rank_snapshot(path: &Path) -> Value {

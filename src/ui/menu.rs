@@ -187,16 +187,14 @@ fn show_result(ok: bool) {
 
 fn show_network_result(setup: &crate::net::NetworkSetup) -> bool {
     crate::net::relay::log_event(&setup.message);
-    if setup.automatic_failover {
-        println!("  \x1b[92m✓\x1b[0m DNS настроен, автоматическое переключение включено");
+    if setup.local_relay_running {
+        println!("  \x1b[92m✓\x1b[0m DNS настроен. Прямое подключение, без фонового подбора");
     } else {
-        eprintln!(
-            "  \x1b[93m!\x1b[0m DNS настроен частично: автоматическое переключение недоступно"
-        );
+        eprintln!("  \x1b[93m!\x1b[0m Используются прямые DNS и сохранённые адреса");
         eprintln!("  {}", setup.message);
         print_error_details();
     }
-    setup.automatic_failover
+    true
 }
 pub fn handle_unlock_all() -> bool {
     clear_screen();
@@ -244,6 +242,9 @@ pub fn handle_patch_files_only() -> bool {
 }
 pub fn handle_dns_only() -> bool {
     if !check_vpn_before_setup() {
+        return false;
+    }
+    if !apply_files_side() {
         return false;
     }
     let ok = match apply_dns_rules() {
@@ -377,9 +378,16 @@ pub fn handle_rollback() -> bool {
             ok = false;
         }
     }
-    for e in crate::core::endpoint::remove_all() {
+    let endpoint_errors = crate::core::endpoint::remove_all();
+    let endpoints_restored = endpoint_errors.is_empty();
+    for e in endpoint_errors {
         operation_error("Не удалось восстановить настройки приложения", &e);
         ok = false;
+    }
+    if !endpoints_restored {
+        operation_error("Шлюз сохранён работающим", "Сначала необходимо восстановить endpoint приложения; остановка сейчас оборвала бы подключение.");
+        pause();
+        return false;
     }
     if let Err(e) = remove_dns_rules() {
         operation_error("Не удалось восстановить подключение", &e);
@@ -435,16 +443,6 @@ pub fn handle_diagnostics() -> bool {
     }
     println!("\n  Проверена сеть. Доступ к моделям и аккаунту этой проверкой не подтверждается.");
     println!("  Откройте Antigravity и отправьте короткий запрос нужной модели.");
-    if let Ok(config) = crate::net::config::load() {
-        let count = crate::net::log_monitor::discover(&config.log_roots).len();
-        if !config.watch_region_errors {
-            println!("  Наблюдение за региональными ошибками отключено в настройках.");
-        } else if count == 0 {
-            println!("  Журналы языкового сервера не найдены: автоматическая реакция на региональный отказ пока невозможна.");
-        } else {
-            println!("  Найдено журналов языкового сервера: {count}.");
-        }
-    }
     if crate::net::socket::legacy_tcp_pending() {
         println!("\n  Сохранены старые настройки сети из предыдущей версии.");
         println!("  Они не относятся к текущему включению обхода.");
@@ -500,7 +498,7 @@ pub fn run_app() {
         println!("  \x1b[96m[5]\x1b[0m  Проверить подключение");
         println!("  \x1b[91m[6]\x1b[0m  Отключить обход");
         println!("  [7]  Сохранить диагностику");
-        println!("  [8]  Сравнить скорость ответов");
+        println!("  [8]  Режим прямого подключения");
         println!("\n  [0]  Выход\n");
 
         match prompt("Выберите действие [0-8]: ").as_str() {
@@ -525,6 +523,7 @@ pub fn run_app() {
             }
             "8" => {
                 super::speed::run();
+                pause();
             }
             "0" => {
                 clear_screen();

@@ -176,7 +176,9 @@ mod windows {
         }
     }
     pub fn apply_if_default() -> Result<String, String> {
-        if read()?.is_some_and(|value| value != expected()) {
+        if read()?
+            .is_some_and(|value| !value_text(&value).is_some_and(|s| super::managed_endpoint(&s)))
+        {
             return Ok("Пользовательский CLOUD_CODE_URL сохранён".into());
         }
         apply()
@@ -236,6 +238,72 @@ mod windows {
         }
         fs::remove_file(path).map_err(|e| e.to_string())
     }
+
+    fn automatic_path() -> PathBuf {
+        crate::net::config::directory().join("automatic-endpoint.json")
+    }
+    fn value_text(value: &Value) -> Option<String> {
+        if !matches!(value.kind, REG_SZ | REG_EXPAND_SZ) || value.data.len() % 2 != 0 {
+            return None;
+        }
+        let chars: Vec<_> = value
+            .data
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .take_while(|c| *c != 0)
+            .collect();
+        String::from_utf16(&chars).ok()
+    }
+    fn automatic_backup() -> Result<Option<Backup>, String> {
+        match fs::read(automatic_path()) {
+            Ok(bytes) => {
+                let backup: Backup = serde_json::from_slice(&bytes)
+                    .map_err(|_| "Повреждена копия автоматического endpoint")?;
+                if backup.schema != 2
+                    || !value_text(&backup.modified).is_some_and(|v| super::is_gateway_endpoint(&v))
+                {
+                    return Err("Неизвестный формат копии автоматического endpoint".into());
+                }
+                Ok(Some(backup))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    pub fn restore_gateway() -> Result<(), String> {
+        let Some(backup) = automatic_backup()? else {
+            return Ok(());
+        };
+        let current = read()?;
+        if current != backup.original {
+            if current.as_ref() != Some(&backup.modified) {
+                return Err("CLOUD_CODE_URL изменён пользователем; копия сохранена".into());
+            }
+            write(backup.original.as_ref())?;
+        }
+        fs::remove_file(automatic_path()).map_err(|e| e.to_string())
+    }
+}
+
+pub(super) fn managed_endpoint(value: &str) -> bool {
+    matches!(
+        value,
+        "" | "https://cloudcode-pa.googleapis.com" | super::endpoint::DAILY_ENDPOINT
+    ) || is_gateway_endpoint(value)
+}
+pub fn restore_gateway() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        windows::restore_gateway()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        super::endpoint_session::restore()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Ok(())
+    }
 }
 
 pub fn apply_if_default() -> Result<String, String> {
@@ -260,4 +328,9 @@ pub fn restore() -> Result<(), String> {
     {
         Ok(())
     }
+}
+
+/// Recognize only endpoints installed by versions 2.3.0/2.3.1, for migration.
+pub(super) fn is_gateway_endpoint(value: &str) -> bool {
+    (18443..=18463).any(|port| value == format!("http://127.0.0.1:{port}"))
 }

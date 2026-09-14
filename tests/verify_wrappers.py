@@ -69,5 +69,71 @@ with tempfile.TemporaryDirectory(prefix="ag wrapper ") as temporary:
         assert result.returncode == 7, (result.returncode, result.stdout, result.stderr)
         assert result.stdout.splitlines() == [a.encode("utf-8").hex() for a in bash_arguments], result.stdout
         print("PASS: Bash syntax, arguments and failure exit code")
+
+        # Exercise source builds without a real Rust installation or sudo call.
+        # BASH_ENV supplies the same macOS identity to the launcher and its child.
+        repository = Path(temporary) / "source checkout with spaces"
+        scripts = repository / "scripts"
+        scripts.mkdir(parents=True)
+        source_wrapper = scripts / "unlock_and_restore.sh"
+        shutil.copyfile(ROOT / "scripts" / source_wrapper.name, source_wrapper)
+        (repository / "Cargo.toml").write_text("# launcher fixture\n", encoding="utf-8")
+        built_engine = repository / "target" / "release" / "antigravity-bypass-russia"
+        built_engine.parent.mkdir(parents=True)
+        engine_template = repository / "engine-template.sh"
+        engine_template.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\nexit 7\n', encoding="utf-8", newline="\n")
+        cargo_dir = repository / "rust toolchain" / "bin"
+        cargo_dir.mkdir(parents=True)
+        cargo_stub = cargo_dir / "cargo"
+        cargo_stub.write_text('''#!/bin/bash
+set -euo pipefail
+[[ "$#" == 5 && "$1" == build && "$2" == --release && "$3" == --locked && "$4" == --manifest-path && "$5" == "$(cd -- "$ABR_TEST_REPOSITORY" && pwd)/Cargo.toml" ]] || exit 92
+id -u > "$ABR_TEST_BUILD_UID"
+rustc --version >/dev/null
+if [[ "$ABR_TEST_BUILD_EXIT" != 0 ]]; then exit "$ABR_TEST_BUILD_EXIT"; fi
+cp -- "$ABR_TEST_ENGINE" "$ABR_TEST_REPOSITORY/target/release/antigravity-bypass-russia"
+chmod +x "$ABR_TEST_REPOSITORY/target/release/antigravity-bypass-russia"
+''', encoding="utf-8", newline="\n")
+        cargo_stub.chmod(0o755)
+        rustc_stub = cargo_dir / "rustc"
+        rustc_stub.write_text('#!/bin/bash\nexit 0\n', encoding="utf-8", newline="\n")
+        rustc_stub.chmod(0o755)
+        environment = repository / "test-environment.sh"
+        environment.write_text('''uname() { if [[ "$1" == -s ]]; then echo Darwin; else echo arm64; fi; }
+id() { if [[ "$1" == -u ]]; then echo "$ABR_TEST_UID"; else command id "$@"; fi; }
+exec() {
+  if [[ "$1" != /usr/bin/sudo ]]; then builtin exec "$@"; fi
+  shift
+  [[ "$1" == -H && "$2" == -u && "$3" == '#501' && "$4" == -- && "$5" == /bin/bash ]] || return 93
+  printf '%s\\n' dropped > "$ABR_TEST_SUDO_MARKER"
+  export ABR_TEST_UID=501
+  unset SUDO_UID
+  shift 4
+  "$@"
+  exit $?
+}
+''', encoding="utf-8", newline="\n")
+        build_uid = repository / "build-uid.txt"
+        sudo_marker = repository / "sudo-used.txt"
+        for mode, uid, sudo_uid, build_exit in [
+            ("Cargo outside PATH", "501", "", "0"),
+            ("old sudo invocation", "0", "501", "0"),
+            ("failed build preserves failure", "501", "", "31"),
+        ]:
+            built_engine.write_text('#!/bin/bash\necho stale-engine\nexit 19\n', encoding="utf-8", newline="\n")
+            built_engine.chmod(0o755)
+            sudo_marker.unlink(missing_ok=True)
+            env = dict(os.environ, PATH="", BASH_ENV=environment.as_posix(),
+                       CARGO_HOME=cargo_dir.parent.as_posix(), SUDO_UID=sudo_uid,
+                       ABR_TEST_UID=uid, ABR_TEST_BUILD_EXIT=build_exit,
+                       ABR_TEST_REPOSITORY=repository.as_posix(), ABR_TEST_ENGINE=engine_template.as_posix(),
+                       ABR_TEST_BUILD_UID=build_uid.as_posix(), ABR_TEST_SUDO_MARKER=sudo_marker.as_posix())
+            result = subprocess.run([bash, str(source_wrapper), *bash_arguments], env=env,
+                                    capture_output=True, text=True, encoding="utf-8", timeout=30)
+            assert result.returncode == (7 if build_exit == "0" else 31), (mode, result)
+            assert result.stdout.splitlines() == (bash_arguments if build_exit == "0" else []), (mode, result)
+            assert build_uid.read_text().strip() == "501", mode
+            assert sudo_marker.exists() == (uid == "0"), mode
+            print(f"PASS: source launcher: {mode}")
     else:
         print("SKIP: Bash not installed")

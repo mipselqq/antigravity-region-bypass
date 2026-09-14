@@ -17,7 +17,7 @@ fn print_help() {
           tune          Оптимизация сетевого стека TCP (Window Auto-Tuning, 512KB)\n\
           diagnostics   DNS, проверка TLS/сертификата и HTTP (без входа в аккаунт)\n\
           report        Сохранить диагностику в JSON [необязательный каталог]\n\
-          speed         Сравнить реальные ответы: endpoint, маршрут и ручные замеры\n\
+          speed         Показать режим прямого подключения\n\
           rollback      Отключить обход и восстановить сохранённые настройки\n\
           status        Отображение текущего статуса системы и выход\n\n\
         Опции:\n\
@@ -30,6 +30,14 @@ fn print_help() {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let command = args.get(1).map(String::as_str).unwrap_or("");
+    #[cfg(target_os = "macos")]
+    if command == "--endpoint-session" {
+        if let Err(error) = core::endpoint_session::restore() {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if command == system::FORWARDER_FLAG {
         net::detach_console();
         if let Err(e) = net::run_dns_relay() {
@@ -77,6 +85,9 @@ fn main() {
     if command == "status" {
         ui::dashboard::print_dashboard();
         return;
+    }
+    if command == "speed" {
+        std::process::exit(if ui::speed::run() { 0 } else { 1 });
     }
     if command == "diagnostics" {
         let ok = ui::menu::handle_diagnostics();

@@ -97,7 +97,7 @@ jobs:
             dist/antigravity-bypass-russia.exe
             dist/unlock_and_restore.ps1
             dist/unlock_and_restore.sh
-          body: Улучшили интерфейс и работу обхода. Исправили ошибки и повысили стабильность.
+          body_path: docs/releases/${{ github.ref_name }}.md
           draft: true
           generate_release_notes: false
           append_body: false

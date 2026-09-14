@@ -7,19 +7,8 @@ pub const DAILY_ENDPOINT: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const IDE_SETTING: &str = "jetski.cloudCodeUrl";
 
 pub fn apply_all() -> Vec<Result<String, String>> {
-    if crate::net::performance::active_preference().is_some() {
-        return vec![Ok(
-            "Endpoint сохранён для сравнения скорости реальных ответов".into(),
-        )];
-    }
-    match crate::net::rank::endpoint_choice() {
-        crate::net::rank::EndpointChoice::Uncertain => {
-            return vec![Ok(
-                "Endpoint сохранён: нет свежего подтверждения альтернативного пути".into(),
-            )]
-        }
-        crate::net::rank::EndpointChoice::Native => return restore_automatic_overrides(),
-        crate::net::rank::EndpointChoice::Daily => {}
+    if let Err(error) = migrate_gateway_settings() {
+        return vec![Err(error)];
     }
     let mut notes = Vec::new();
     for inst in find_installations() {
@@ -47,6 +36,75 @@ pub fn apply_all() -> Vec<Result<String, String>> {
     notes
 }
 
+/// Restore the settings journalled by 2.3.0/2.3.1 before stopping their gateway.
+fn migrate_gateway_settings() -> Result<(), String> {
+    super::endpoint_env::restore_gateway()?;
+    for path in settings_paths() {
+        restore_gateway_profile(&path)?;
+    }
+    Ok(())
+}
+fn restore_gateway_profile(path: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let value = jsonc_parser::parse_to_serde_value(
+        text.trim_start_matches('\u{feff}'),
+        &Default::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    let local = value
+        .as_ref()
+        .and_then(|v| v.get(IDE_SETTING))
+        .and_then(|v| v.as_str())
+        .is_some_and(super::endpoint_env::is_gateway_endpoint);
+    if local && !crate::system::journal::restore(path)? {
+        return Err(format!(
+            "{}: отсутствует исходная копия настройки локального шлюза",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+#[cfg(test)]
+fn apply_automatic_settings(path: &Path, endpoint: &str) -> Result<String, String> {
+    let Some(text) = automatic_settings_text(path)? else {
+        return Ok("Собственный endpoint профиля сохранён".into());
+    };
+    let updated = upsert_key(&text, IDE_SETTING, endpoint)?;
+    if updated != text {
+        crate::system::journal::apply(
+            path,
+            Some(text.as_bytes()),
+            updated.as_bytes(),
+            "automatic-endpoint-jsonc",
+        )?;
+    }
+    Ok("Профиль подключён к автоматическому выбору маршрутов".into())
+}
+#[cfg(test)]
+fn automatic_settings_text(path: &Path) -> Result<Option<String>, String> {
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let value = jsonc_parser::parse_to_serde_value(
+        text.trim_start_matches('\u{feff}'),
+        &Default::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    if let Some(setting) = value
+        .as_ref()
+        .and_then(|v| v.get(IDE_SETTING))
+        .filter(|v| !v.is_null())
+    {
+        let Some(setting) = setting.as_str() else {
+            return Err("Некорректный jetski.cloudCodeUrl; настройка сохранена".into());
+        };
+        if !super::endpoint_env::managed_endpoint(setting) {
+            return Ok(None);
+        }
+    }
+    // Also validate the object shape and duplicate keys before writing env.
+    upsert_key(&text, IDE_SETTING, DAILY_ENDPOINT)?;
+    Ok(Some(text))
+}
+
 pub fn settings_paths() -> Vec<PathBuf> {
     let mut paths: Vec<_> = find_installations()
         .iter()
@@ -61,9 +119,13 @@ pub fn settings_paths() -> Vec<PathBuf> {
     }
     paths.sort();
     paths.dedup();
+    // Standalone Antigravity has no VS Code User/settings.json. Its endpoint is
+    // configured through CLOUD_CODE_URL; a missing IDE profile is not an error.
+    paths.retain(|path| path.exists());
     paths
 }
 
+#[cfg(test)]
 pub fn selected_host(path: &Path) -> Result<String, String> {
     let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let value = jsonc_parser::parse_to_serde_value(
@@ -86,6 +148,7 @@ pub fn selected_host(path: &Path) -> Result<String, String> {
 
 /// An explicit test selection; native and daily are both journalled, so switching
 /// repeatedly still restores the original settings on rollback.
+#[cfg(test)]
 pub fn select_for_test(path: &Path, host: &str) -> Result<(), String> {
     selected_host(path)?;
     if !matches!(
@@ -139,6 +202,9 @@ fn restore_automatic_overrides() -> Vec<Result<String, String>> {
 
 pub fn remove_all() -> Vec<String> {
     let mut errors = Vec::new();
+    if let Err(error) = super::endpoint_env::restore_gateway() {
+        errors.push(error);
+    }
     let mut paths = Vec::new();
     for inst in find_installations() {
         if let Some(p) = ide_settings_path(&inst) {
@@ -265,8 +331,9 @@ fn apply_daily_settings(path: &Path) -> Result<String, String> {
         .map_err(|e| format!("settings.json не изменён: {e}"))?;
         if let Some(value) = value.and_then(|v| v.get(IDE_SETTING).cloned()) {
             if !value.is_null()
-                && value.as_str() != Some(DAILY_ENDPOINT)
-                && value.as_str() != Some("")
+                && !value
+                    .as_str()
+                    .is_some_and(super::endpoint_env::managed_endpoint)
             {
                 return Ok("Пользовательский jetski.cloudCodeUrl сохранён".into());
             }
@@ -385,6 +452,15 @@ fn upsert_key(text: &str, key: &str, value: &str) -> Result<String, String> {
         .value()
         .and_then(|v| v.as_object())
         .ok_or("settings.json должен быть объектом")?;
+    if object
+        .properties()
+        .iter()
+        .filter(|p| p.name().and_then(|n| n.decoded_value().ok()).as_deref() == Some(key))
+        .count()
+        > 1
+    {
+        return Err("Повторный ключ endpoint: неоднозначные настройки сохранены".into());
+    }
     if let Some(prop) = object.get(key) {
         prop.set_value(value.into());
     } else {
@@ -397,6 +473,51 @@ fn upsert_key(text: &str, key: &str, value: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn classic_migration_removes_loopback_and_preserves_original_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let original = "{ // original\n \"editor.fontSize\": 18, }";
+        std::fs::write(&path, original).unwrap();
+        super::apply_automatic_settings(&path, "http://127.0.0.1:18443").unwrap();
+        super::restore_gateway_profile(&path).unwrap();
+        super::apply_daily_settings(&path).unwrap();
+        let classic = std::fs::read_to_string(&path).unwrap();
+        assert!(classic.contains(super::DAILY_ENDPOINT));
+        assert!(!classic.contains("127.0.0.1"));
+        assert!(classic.contains("// original") && classic.contains("18"));
+        super::restore_gateway_profile(&path).unwrap();
+        super::remove_settings_file(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+    #[test]
+    fn automatic_endpoint_is_reversible_and_preserves_custom_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = "{\n // keep\n \"editor.fontSize\":19,\n}";
+        std::fs::write(&path, original).unwrap();
+        super::apply_automatic_settings(&path, "http://127.0.0.1:18443").unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("http://127.0.0.1:18443"));
+        super::remove_settings_file(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let custom = "{\"jetski.cloudCodeUrl\":\"https://custom.example\"}";
+        std::fs::write(&path, custom).unwrap();
+        assert!(super::automatic_settings_text(&path).unwrap().is_none());
+        super::apply_automatic_settings(&path, "http://127.0.0.1:18443").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+        for invalid in [
+            "[]",
+            "{broken",
+            "{\"jetski.cloudCodeUrl\":5}",
+            "{\"jetski.cloudCodeUrl\":\"\",\"jetski.cloudCodeUrl\":\"\"}",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(super::automatic_settings_text(&path).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+        }
+    }
     #[test]
     fn explicit_endpoint_comparison_preserves_jsonc_and_original_rollback() {
         let dir = tempfile::tempdir().unwrap();
