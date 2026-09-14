@@ -52,7 +52,7 @@ TLS/HTTP-проверка подтверждает достижимость се
 Проверки launchers: `python tests/verify_wrappers.py` и
 `python tests/verify_macos_bundle.py`. Они используют временные файлы и
 тестовый executable. Workflow `Regression checks` запускает проверки на
-Windows x64, macOS ARM64 и macOS Intel для PR и веток `main`/`codex/**`.
+Windows x64, macOS ARM64 и macOS Intel для PR и веток `main`/`fix/**`.
 Успех этих проверок не является проверкой генерации в аккаунте Google.
 
 Первый прогон ветки: [GitHub Actions, 4800238](https://github.com/vezlin1/antigravity-bypass-russia/actions/runs/34853376101)
