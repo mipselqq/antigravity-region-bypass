@@ -16,7 +16,8 @@ use crate::net::relay::{self, load_if_index};
 use crate::net::resolvers;
 use crate::net::routes;
 
-const FULL_EVERY: Duration = Duration::from_secs(5 * 60);
+const FULL_EVERY: Duration = Duration::from_secs(15 * 60);
+const BACKUP_EVERY: Duration = Duration::from_secs(120);
 const WATCH_EVERY: Duration = Duration::from_secs(15);
 const START_DELAY: Duration = Duration::from_secs(20);
 const MIN_RESCAN_AFTER_DEAD: Duration = Duration::from_secs(60);
@@ -39,7 +40,9 @@ pub fn spawn_background(manage_system: bool) {
             .checked_sub(FULL_EVERY)
             .unwrap_or_else(Instant::now);
         let mut seen_revision = 0;
+        let mut attempted_revision = None;
         let mut last_network = None;
+        let mut last_backups = Instant::now();
         loop {
             let configuration = match super::configuration_lock() {
                 Ok(lock) => lock,
@@ -51,7 +54,8 @@ pub fn spawn_background(manage_system: bool) {
             };
             let changed_network = refresh_interface(&mut last_network);
             let stale = file_age().map(|a| a >= FULL_EVERY).unwrap_or(true);
-            let leader_dead = any_path_dead();
+            let failed_hosts = failed_leaders();
+            let leader_dead = !failed_hosts.is_empty();
             let revision = super::route_health::store()
                 .snapshot()
                 .map(|s| s.revision)
@@ -59,13 +63,21 @@ pub fn spawn_background(manage_system: bool) {
             let refused = revision != seen_revision;
             let since = last_full.elapsed();
             let run = changed_network
-                || refused
+                || (refused
+                    && (attempted_revision != Some(revision) || since >= MIN_RESCAN_AFTER_DEAD))
                 || (leader_dead && since >= MIN_RESCAN_AFTER_DEAD)
-                || (stale && since >= WATCH_EVERY)
-                || (stale && !rank_path().exists());
+                || (stale && since >= MIN_RESCAN_AFTER_DEAD);
             if run {
                 let why = if leader_dead { "path-down" } else { "periodic" };
-                let ranked = rescan(load_if_index(), manage_system);
+                // A single failed primary only rediscovers its own host.
+                let only = if leader_dead && !changed_network && !refused && !stale {
+                    Some(failed_hosts.as_slice())
+                } else {
+                    None
+                };
+                let ranked = rescan_selected(load_if_index(), manage_system, only);
+                attempted_revision = Some(revision);
+                last_full = Instant::now(); // Bound retries after unsuccessful discovery too.
                 match ranked {
                     Ok(r) => {
                         seen_revision = revision;
@@ -87,17 +99,16 @@ pub fn spawn_background(manage_system: bool) {
                         relay::log_fatal(&error);
                     }
                 }
-            } else if manage_system {
-                // VPN may have wiped /32s; cheap to re-pin current proxy IPs.
-                refresh_routes_from_disk();
+            } else if last_backups.elapsed() >= BACKUP_EVERY {
+                // Backup failures update health only; they do not invalidate a
+                // working primary or trigger another provider-wide discovery.
+                probe_backups();
+                if manage_system {
+                    refresh_routes_from_disk();
+                }
+                last_backups = Instant::now();
             }
             drop(configuration);
-            for host in NRPT_AGENT {
-                let _ = resolvers::resolve_best(
-                    &super::client::build_query(host, 0xB712),
-                    load_if_index(),
-                );
-            }
             thread::sleep(WATCH_EVERY);
         }
     });
@@ -130,11 +141,19 @@ pub fn rescan_agent(if_index: u32) -> Result<Vec<RankedHost>, String> {
 }
 
 fn rescan(if_index: u32, manage_system: bool) -> Result<Vec<RankedHost>, String> {
-    resolvers::invalidate_network_caches();
+    rescan_selected(if_index, manage_system, None)
+}
+
+fn rescan_selected(
+    if_index: u32,
+    manage_system: bool,
+    only: Option<&[String]>,
+) -> Result<Vec<RankedHost>, String> {
     let previous = load();
     let candidates = thread::scope(|scope| {
         let jobs: Vec<_> = NRPT_AGENT
             .iter()
+            .filter(|name| only.is_none_or(|names| names.iter().any(|n| n == **name)))
             .map(|name| {
                 let previous = &previous;
                 scope.spawn(move || {
@@ -177,7 +196,7 @@ fn rescan(if_index: u32, manage_system: bool) -> Result<Vec<RankedHost>, String>
             .collect();
         routes::sync_physical_hosts(&all)?;
     }
-    let ranked = thread::scope(|scope| {
+    let mut ranked = thread::scope(|scope| {
         let jobs: Vec<_> = candidates
             .into_iter()
             .map(|(host, candidates)| {
@@ -197,7 +216,6 @@ fn rescan(if_index: u32, manage_system: bool) -> Result<Vec<RankedHost>, String>
                                 .find(|(ip, _)| IpAddr::V4(*ip) == a.ip())
                                 .copied()
                         })
-                        .take(MAX_FALLBACKS)
                         .collect();
                     Ok::<_, String>(RankedHost { host, ips })
                 })
@@ -207,13 +225,40 @@ fn rescan(if_index: u32, manage_system: bool) -> Result<Vec<RankedHost>, String>
             .map(|j| j.join().map_err(|_| "Прервано ранжирование".to_string())?)
             .collect::<Result<Vec<_>, String>>()
     })?;
+    preserve_primaries(&previous, &mut ranked, only.is_some());
+    super::performance::prioritize(&mut ranked);
+    for host in &mut ranked {
+        host.ips.truncate(MAX_FALLBACKS);
+    }
     validate_ranked(&ranked)?;
     save(&ranked)?;
     if manage_system {
         apply_hosts(&ranked)?;
         routes::sync_physical_hosts(&ranked_ips(&ranked))?;
     }
+    if hosts_entries(&previous) != hosts_entries(&ranked) {
+        resolvers::invalidate_network_caches();
+        if manage_system {
+            super::flush_dns_cache()?;
+        }
+    }
     Ok(ranked)
+}
+
+fn preserve_primaries(previous: &[RankedHost], ranked: &mut Vec<RankedHost>, partial: bool) {
+    for old in previous {
+        if let Some(next) = ranked.iter_mut().find(|h| h.host == old.host) {
+            // Keep a healthy primary. HEAD timing noise is not model latency.
+            if let Some((primary, _)) = old.ips.first() {
+                if let Some(pos) = next.ips.iter().position(|(ip, _)| ip == primary) {
+                    let entry = next.ips.remove(pos);
+                    next.ips.insert(0, entry);
+                }
+            }
+        } else if partial {
+            ranked.push(old.clone());
+        }
+    }
 }
 
 fn validate_ranked(ranked: &[RankedHost]) -> Result<(), String> {
@@ -257,7 +302,10 @@ pub fn endpoint_choice() -> EndpointChoice {
 }
 fn choose_endpoint(ranked: &[RankedHost]) -> EndpointChoice {
     let has = |name: &str| ranked.iter().any(|h| h.host == name && !h.ips.is_empty());
-    if has("cloudcode-pa.googleapis.com") {
+    if has("cloudcode-pa.googleapis.com") && has("daily-cloudcode-pa.googleapis.com") {
+        // Availability alone cannot justify undoing a working endpoint choice.
+        EndpointChoice::Uncertain
+    } else if has("cloudcode-pa.googleapis.com") {
         EndpointChoice::Native
     } else if has("daily-cloudcode-pa.googleapis.com") {
         EndpointChoice::Daily
@@ -295,15 +343,21 @@ fn file_age() -> Option<Duration> {
     SystemTime::now().duration_since(modified).ok()
 }
 
-fn any_path_dead() -> bool {
+fn failed_leaders() -> Vec<String> {
     let ranked = load();
     let outcomes = thread::scope(|scope| {
         let jobs: Vec<_> = ranked
             .iter()
-            .flat_map(|h| h.ips.iter().map(move |(ip, _)| (*ip, h.host.clone())))
+            .filter_map(|h| h.ips.first().map(|(ip, _)| (*ip, h.host.clone())))
             .map(|(ip, host)| {
                 scope.spawn(move || {
-                    let ok = super::health::check_ip((ip, 443).into(), &host, true).is_ok();
+                    let ok = super::health::check_ip((ip, 443).into(), &host, true).is_ok()
+                        || super::route_health::store().snapshot().is_ok_and(|s| {
+                            !s.failure_confirmed(
+                                &super::route_health::Key::ip(&host, (ip, 443).into()),
+                                super::route_health::now_ms(),
+                            )
+                        });
                     (ip, host, ok)
                 })
             })
@@ -312,29 +366,41 @@ fn any_path_dead() -> bool {
             .filter_map(|j| j.join().ok())
             .collect::<Vec<_>>()
     });
-    needs_refresh(&ranked, |ip, host| {
+    failed_primary_names(&ranked, |ip, host| {
         outcomes
             .iter()
             .any(|(a, h, ok)| *a == ip && h == host && *ok)
     })
 }
 
-fn needs_refresh(ranked: &[RankedHost], mut probe: impl FnMut(Ipv4Addr, &str) -> bool) -> bool {
-    if ranked.len() != NRPT_AGENT.len() {
-        return true;
-    }
-    let mut failed = false;
+fn failed_primary_names(
+    ranked: &[RankedHost],
+    mut probe: impl FnMut(Ipv4Addr, &str) -> bool,
+) -> Vec<String> {
+    let mut failed = Vec::new();
     for host in ranked {
-        if host.ips.is_empty() {
-            failed = true;
-        }
-        for (ip, _) in &host.ips {
+        // Never-installed/empty alternatives are rediscovered periodically;
+        // they cannot invalidate another endpoint that is already working.
+        for (ip, _) in host.ips.iter().take(1) {
             if !probe(*ip, &host.host) {
-                failed = true;
+                failed.push(host.host.clone());
             }
         }
     }
     failed
+}
+
+fn probe_backups() {
+    let ranked = load();
+    thread::scope(|scope| {
+        for host in &ranked {
+            for (ip, _) in host.ips.iter().skip(1) {
+                scope.spawn(move || {
+                    let _ = super::health::check_ip((*ip, 443).into(), &host.host, true);
+                });
+            }
+        }
+    });
 }
 
 fn ranked_ips(ranked: &[RankedHost]) -> Vec<Ipv4Addr> {
@@ -458,9 +524,63 @@ fn load() -> Vec<RankedHost> {
     ranked
 }
 
+pub fn select_for_test(host: &str, ip: Ipv4Addr) -> Result<(), String> {
+    let mut ranked = load();
+    let row = ranked
+        .iter_mut()
+        .find(|row| row.host == host)
+        .ok_or("Сначала включите обход для поиска маршрутов")?;
+    if !row.ips.iter().any(|(address, _)| *address == ip) {
+        return Err("Маршрут больше не входит в проверенные кандидаты. Повторите выбор.".into());
+    }
+    routes::sync_physical_hosts(&[ip])?;
+    let ms = super::health::check_ip((ip, 443).into(), host, true)?;
+    row.ips.retain(|(address, _)| *address != ip);
+    row.ips.insert(0, (ip, ms));
+    row.ips.truncate(MAX_FALLBACKS);
+    save(&ranked)?;
+    apply_hosts(&ranked)?;
+    resolvers::invalidate_network_caches();
+    super::flush_dns_cache()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targeted_repair_preserves_unrelated_hosts_and_a_healthy_primary() {
+        let a = Ipv4Addr::new(192, 0, 2, 1);
+        let b = Ipv4Addr::new(192, 0, 2, 2);
+        let old = vec![
+            RankedHost {
+                host: "cloudcode-pa.googleapis.com".into(),
+                ips: vec![(a, 200), (b, 100)],
+            },
+            RankedHost {
+                host: "daily-cloudcode-pa.googleapis.com".into(),
+                ips: vec![(b, 100)],
+            },
+        ];
+        let mut repaired = vec![RankedHost {
+            host: old[0].host.clone(),
+            ips: vec![(b, 20), (a, 180)],
+        }];
+        preserve_primaries(&old, &mut repaired, true);
+        assert_eq!(repaired[0].ips[0].0, a);
+        assert_eq!(repaired[1], old[1]);
+        repaired[0].ips.retain(|(ip, _)| *ip != a);
+        preserve_primaries(&old, &mut repaired, true);
+        assert_eq!(repaired[0].ips[0].0, b); // Failed primary must not be restored.
+        assert!(failed_primary_names(
+            &[RankedHost {
+                host: old[0].host.clone(),
+                ips: vec![]
+            }],
+            |_, _| false
+        )
+        .is_empty());
+    }
     #[test]
     fn failed_rescan_removes_region_refused_pins_but_preserves_temporarily_offline_hosts() {
         use super::super::route_health::{Key, State};
@@ -527,7 +647,7 @@ mod tests {
         assert!(validate_ranked(&hosts).is_ok());
     }
     #[test]
-    fn native_endpoint_is_preferred_and_daily_requires_a_verified_alternative() {
+    fn two_available_endpoints_preserve_the_existing_choice() {
         let row = |host: &str| RankedHost {
             host: host.into(),
             ips: vec![(Ipv4Addr::LOCALHOST, 1)],
@@ -542,7 +662,7 @@ mod tests {
                 row("daily-cloudcode-pa.googleapis.com"),
                 row("cloudcode-pa.googleapis.com")
             ]),
-            EndpointChoice::Native
+            EndpointChoice::Uncertain
         );
         assert_eq!(
             choose_endpoint(&[row("generativelanguage.googleapis.com")]),
@@ -550,7 +670,7 @@ mod tests {
         );
     }
     #[test]
-    fn every_host_and_fallback_is_checked_even_if_the_first_host_is_healthy() {
+    fn backup_failure_does_not_trigger_primary_rediscovery() {
         let ranked: Vec<_> = NRPT_AGENT
             .iter()
             .map(|h| RankedHost {
@@ -559,12 +679,16 @@ mod tests {
             })
             .collect();
         let mut calls = 0;
-        assert!(needs_refresh(&ranked, |_, h| {
-            calls += 1;
-            h != NRPT_AGENT[1]
-        }));
-        assert_eq!(calls, 6);
-        assert!(!needs_refresh(&ranked, |_, _| true));
-        assert!(needs_refresh(&[], |_, _| true));
+        assert_eq!(
+            failed_primary_names(&ranked, |_, h| {
+                calls += 1;
+                h != NRPT_AGENT[1]
+            }),
+            vec![NRPT_AGENT[1].to_string()]
+        );
+        assert_eq!(calls, 3);
+        assert!(failed_primary_names(&ranked, |ip, _| ip == Ipv4Addr::LOCALHOST).is_empty());
+        assert!(failed_primary_names(&ranked, |_, _| true).is_empty());
+        assert!(failed_primary_names(&[], |_, _| true).is_empty());
     }
 }

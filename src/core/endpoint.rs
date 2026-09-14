@@ -7,6 +7,11 @@ pub const DAILY_ENDPOINT: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const IDE_SETTING: &str = "jetski.cloudCodeUrl";
 
 pub fn apply_all() -> Vec<Result<String, String>> {
+    if crate::net::performance::active_preference().is_some() {
+        return vec![Ok(
+            "Endpoint сохранён для сравнения скорости реальных ответов".into(),
+        )];
+    }
     match crate::net::rank::endpoint_choice() {
         crate::net::rank::EndpointChoice::Uncertain => {
             return vec![Ok(
@@ -40,6 +45,66 @@ pub fn apply_all() -> Vec<Result<String, String>> {
     }
     notes.push(super::endpoint_env::apply_if_default());
     notes
+}
+
+pub fn settings_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<_> = find_installations()
+        .iter()
+        .filter_map(|p| ide_settings_path(p))
+        .collect();
+    for folder in ["Antigravity", "Antigravity IDE", "Google Antigravity"] {
+        if let Some(path) = appdata_settings(folder) {
+            if path.exists() {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+pub fn selected_host(path: &Path) -> Result<String, String> {
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let value = jsonc_parser::parse_to_serde_value(
+        text.trim_start_matches('\u{feff}'),
+        &Default::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    let setting = value.as_ref().and_then(|v| v.get(IDE_SETTING));
+    let endpoint = match setting {
+        None | Some(serde_json::Value::Null) => "",
+        Some(serde_json::Value::String(value)) => value.as_str(),
+        _ => return Err("Некорректный jetski.cloudCodeUrl; настройки не изменены".into()),
+    };
+    match endpoint {
+        "" | "https://cloudcode-pa.googleapis.com" => Ok("cloudcode-pa.googleapis.com".into()),
+        DAILY_ENDPOINT => Ok("daily-cloudcode-pa.googleapis.com".into()),
+        _ => Err("В этом профиле задан собственный endpoint. Выберите профиль со стандартным Cloud Code.".into()),
+    }
+}
+
+/// An explicit test selection; native and daily are both journalled, so switching
+/// repeatedly still restores the original settings on rollback.
+pub fn select_for_test(path: &Path, host: &str) -> Result<(), String> {
+    selected_host(path)?;
+    if !matches!(
+        host,
+        "cloudcode-pa.googleapis.com" | "daily-cloudcode-pa.googleapis.com"
+    ) {
+        return Err("Неизвестный endpoint".into());
+    }
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let updated = upsert_key(&text, IDE_SETTING, &format!("https://{host}"))?;
+    if updated != text {
+        crate::system::journal::apply(
+            path,
+            Some(text.as_bytes()),
+            updated.as_bytes(),
+            "settings-jsonc",
+        )?;
+    }
+    Ok(())
 }
 
 fn restore_automatic_overrides() -> Vec<Result<String, String>> {
@@ -332,6 +397,37 @@ fn upsert_key(text: &str, key: &str, value: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_endpoint_comparison_preserves_jsonc_and_original_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = "{\n // user setting\n \"editor.fontSize\": 15,\n}\n";
+        std::fs::write(&path, original).unwrap();
+        super::select_for_test(&path, "daily-cloudcode-pa.googleapis.com").unwrap();
+        assert_eq!(
+            super::selected_host(&path).unwrap(),
+            "daily-cloudcode-pa.googleapis.com"
+        );
+        super::select_for_test(&path, "cloudcode-pa.googleapis.com").unwrap();
+        assert_eq!(
+            super::selected_host(&path).unwrap(),
+            "cloudcode-pa.googleapis.com"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("// user setting"));
+        super::remove_settings_file(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        for custom in [
+            r#"{"jetski.cloudCodeUrl":"https://custom.example"}"#,
+            r#"{"jetski.cloudCodeUrl":123}"#,
+            "{broken",
+        ] {
+            std::fs::write(&path, custom).unwrap();
+            assert!(super::select_for_test(&path, "cloudcode-pa.googleapis.com").is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+        }
+    }
     use super::*;
     #[test]
     fn legacy_daily_cleanup_is_archived_idempotent_and_preserves_other_settings() {

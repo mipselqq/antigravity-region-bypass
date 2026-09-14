@@ -7,6 +7,7 @@ pub mod health;
 pub mod hosts;
 pub mod log_monitor;
 pub mod nrpt;
+pub mod performance;
 pub mod provider;
 pub mod rank;
 pub mod relay;
@@ -387,6 +388,16 @@ fn remove_dns_configuration(restore_tcp: bool) -> Result<(), String> {
     let _configuration = configuration_lock()?;
     // Stop the background writer, but retain its directory and every backup.
     crate::system::service::disable()?;
+    match performance::load() {
+        Ok(mut comparison) => {
+            if comparison.preference.take().is_some() {
+                if let Err(error) = performance::save(&comparison) {
+                    errors.push(error);
+                }
+            }
+        }
+        Err(error) => relay::log_event(&format!("Результаты сравнения не прочитаны: {error}")),
+    }
     // Remove only the obsolete marker from the experimental TUN mode.
     let legacy_mode = relay::log_dir().join("hosts-mode");
     match std::fs::remove_file(legacy_mode) {

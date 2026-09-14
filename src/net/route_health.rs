@@ -100,6 +100,25 @@ impl Default for State {
     }
 }
 impl State {
+    /// A bounded grace period lets DNS use a verified route while background
+    /// probes refresh it. Failures and regional refusals take effect immediately.
+    pub fn usable(&self, key: &Key, now: u64, max_age_ms: u64) -> bool {
+        self.entries.get(&key.id()).is_some_and(|e| {
+            e.ok && !e.blocked(now)
+                && e.checked_ms > 0
+                && e.checked_ms <= now
+                && now - e.checked_ms < max_age_ms
+        })
+    }
+
+    pub fn failure_confirmed(&self, key: &Key, now: u64) -> bool {
+        self.region_blocked(key, now)
+            || self
+                .entries
+                .get(&key.id())
+                .is_some_and(|e| !e.ok && e.failures >= 2)
+    }
+
     /// Export only typed route metadata for the supported hosts, never event IDs or raw input.
     pub fn diagnostic_snapshot(&self, now: u64) -> serde_json::Value {
         let entries: Vec<_> = self

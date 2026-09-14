@@ -500,9 +500,10 @@ pub fn run_app() {
         println!("  \x1b[96m[5]\x1b[0m  Проверить подключение");
         println!("  \x1b[91m[6]\x1b[0m  Отключить обход");
         println!("  [7]  Сохранить диагностику");
+        println!("  [8]  Сравнить скорость ответов");
         println!("\n  [0]  Выход\n");
 
-        match prompt("Выберите действие [0-7]: ").as_str() {
+        match prompt("Выберите действие [0-8]: ").as_str() {
             "1" => {
                 handle_unlock_all();
             }
@@ -521,6 +522,9 @@ pub fn run_app() {
             }
             "7" => {
                 handle_save_diagnostics(None);
+            }
+            "8" => {
+                super::speed::run();
             }
             "0" => {
                 clear_screen();

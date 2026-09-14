@@ -17,6 +17,7 @@ fn print_help() {
           tune          Оптимизация сетевого стека TCP (Window Auto-Tuning, 512KB)\n\
           diagnostics   DNS, проверка TLS/сертификата и HTTP (без входа в аккаунт)\n\
           report        Сохранить диагностику в JSON [необязательный каталог]\n\
+          speed         Сравнить реальные ответы: endpoint, маршрут и ручные замеры\n\
           rollback      Отключить обход и восстановить сохранённые настройки\n\
           status        Отображение текущего статуса системы и выход\n\n\
         Опции:\n\
@@ -51,6 +52,7 @@ fn main() {
         "" | "status"
             | "diagnostics"
             | "report"
+            | "speed"
             | "unlock"
             | "patch-files"
             | "dns"
@@ -94,6 +96,7 @@ fn main() {
         "unlock" => ui::menu::handle_unlock_all(),
         "patch-files" => ui::menu::handle_patch_files_only(),
         "dns" => ui::menu::handle_dns_only(),
+        "speed" => ui::speed::run(),
         "rollback" | "restore" => ui::menu::handle_rollback(),
         "tune" | "--tune" => match net::socket::tune_os_network_stack() {
             Ok(logs) => {

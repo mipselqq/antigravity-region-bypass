@@ -511,6 +511,15 @@ fn cache_dns_packet(name: String, qtype: u16, reply: Vec<u8>, provider: &str, ve
         let cmap = cguard.get_or_insert_with(HashMap::new);
         if cmap.len() >= 64 {
             cmap.retain(|_, (_, _, _, at)| at.elapsed() < DNS_PACKET_CACHE_TTL);
+            if cmap.len() >= 64 {
+                if let Some(oldest) = cmap
+                    .iter()
+                    .min_by_key(|(_, (_, _, _, at))| *at)
+                    .map(|(key, _)| key.clone())
+                {
+                    cmap.remove(&oldest);
+                }
+            }
         }
         cmap.insert(
             (name, qtype),
@@ -519,14 +528,31 @@ fn cache_dns_packet(name: String, qtype: u16, reply: Vec<u8>, provider: &str, ve
     }
 }
 
-pub fn resolve_best(query: &[u8], if_index: u32) -> Option<ResolveHit> {
+/// No network calls or state writes. Cold resolution is scheduled separately
+/// by the relay, so occupied discovery workers cannot delay a cached answer.
+pub fn resolve_cached(query: &[u8]) -> Option<ResolveHit> {
     let name = question_name(query)?.to_ascii_lowercase();
-    let qtype = question_type(query)?;
     let state = super::route_health::store().snapshot().ok()?;
     let revision = state.revision;
     if NETWORK_REVISION.swap(revision, Ordering::SeqCst) != revision {
         invalidate_network_caches();
     }
+    let ranked = if super::provider::NRPT_AGENT.contains(&name.as_str()) {
+        super::rank::candidates_for(&name)
+    } else {
+        vec![]
+    };
+    cached_answer(query, &state, &ranked, super::route_health::now_ms())
+}
+
+fn cached_answer(
+    query: &[u8],
+    state: &super::route_health::State,
+    ranked: &[Ipv4Addr],
+    now: u64,
+) -> Option<ResolveHit> {
+    let name = question_name(query)?.to_ascii_lowercase();
+    let qtype = question_type(query)?;
     let cached = DNS_PACKET_CACHE.lock().ok().and_then(|g| {
         g.as_ref()
             .and_then(|m| m.get(&(name.clone(), qtype)).cloned())
@@ -534,8 +560,17 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<ResolveHit> {
     if let Some((mut reply, provider, verdict, at)) = cached {
         if at.elapsed() < DNS_PACKET_CACHE_TTL {
             reply[..2].copy_from_slice(&query[..2]);
-            if let Some(reply) = drop_dead(&reply, &name)
-                .and_then(|r| super::client::age_ttls(&r, at.elapsed().as_secs() as u32, 20))
+            let addresses = answer_addrs(&reply);
+            if let Some(reply) = (!addresses.is_empty()
+                && addresses.iter().all(|ip| {
+                    state.usable(
+                        &super::route_health::Key::ip(&name, (*ip, 443).into()),
+                        now,
+                        120_000,
+                    )
+                }))
+            .then(|| super::client::age_ttls(&reply, at.elapsed().as_secs() as u32, 20))
+            .flatten()
             {
                 return Some(ResolveHit {
                     reply,
@@ -550,17 +585,14 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<ResolveHit> {
             }
         }
     }
-    // A fresh ranked route is already verified: do not make the first client
-    // DNS request wait for all external DNS timeouts after the relay starts.
-    let ranked = if super::provider::NRPT_AGENT.contains(&name.as_str()) {
-        super::rank::candidates_for(&name)
-    } else {
-        vec![]
-    };
     if qtype == 1 {
-        let keys = fresh_ranked_keys(&name, &ranked, &state, super::route_health::now_ms());
+        let keys: Vec<_> = ranked
+            .iter()
+            .map(|ip| super::route_health::Key::ip(&name, (*ip, 443).into()))
+            .filter(|key| state.usable(key, now, 120_000))
+            .collect();
         if !keys.is_empty() {
-            if let Some(key) = super::route_health::order(&keys).ok()?.first() {
+            if let Some(key) = keys.first() {
                 if let Ok(SocketAddr::V4(addr)) = key.route.parse::<SocketAddr>() {
                     let reply = super::client::address_response(query, &[*addr.ip()])?;
                     cache_dns_packet(
@@ -576,6 +608,52 @@ pub fn resolve_best(query: &[u8], if_index: u32) -> Option<ResolveHit> {
                         verdict: Verdict::Substituted,
                     });
                 }
+            }
+        }
+    }
+    None
+}
+
+pub fn refresh_due(query: &[u8]) -> bool {
+    let Some(name) = question_name(query) else {
+        return false;
+    };
+    let Some(qtype) = question_type(query) else {
+        return false;
+    };
+    DNS_PACKET_CACHE
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|m| m.get(&(name.to_ascii_lowercase(), qtype)))
+                .map(|(_, _, _, at)| at.elapsed() >= Duration::from_secs(10))
+        })
+        .unwrap_or(true)
+}
+
+/// Only background discovery workers call this path.
+pub fn refresh_answer(query: &[u8], if_index: u32) -> Option<ResolveHit> {
+    let name = question_name(query)?.to_ascii_lowercase();
+    let qtype = question_type(query)?;
+    let ranked = super::rank::candidates_for(&name);
+    // Refresh the current path before contacting every DNS provider.
+    if qtype == 1 {
+        for ip in &ranked {
+            if super::health::check_ip((*ip, 443).into(), &name, false).is_ok() {
+                let reply = super::client::address_response(query, &[*ip])?;
+                cache_dns_packet(
+                    name,
+                    qtype,
+                    reply.clone(),
+                    "ranked-sni",
+                    Verdict::Substituted,
+                );
+                return Some(ResolveHit {
+                    reply,
+                    provider: "ranked-sni".into(),
+                    verdict: Verdict::Substituted,
+                });
             }
         }
     }
@@ -697,6 +775,7 @@ fn ranked_hit(query: &[u8], addresses: &[Ipv4Addr]) -> Option<RaceResult> {
     })
 }
 
+#[cfg(test)]
 fn fresh_ranked_keys(
     name: &str,
     addresses: &[Ipv4Addr],
@@ -755,6 +834,52 @@ pub fn verdict_tag(v: Verdict) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_dns_never_waits_for_a_stale_tls_probe_and_honours_failures() {
+        let name = "cached-fast-lane.test";
+        let query = build_query(name, 0x1234);
+        let ip = Ipv4Addr::new(192, 0, 2, 10);
+        let key = super::super::route_health::Key::ip(name, (ip, 443).into());
+        let mut state = super::super::route_health::State::default();
+        state.record(&key, Ok(30), 1000);
+        // Transport freshness expired; bounded last-good DNS grace still applies.
+        assert_eq!(state.cached(&key, 30_000), None);
+        let (tx, rx) = mpsc::channel();
+        let fixture = state.clone();
+        thread::spawn(move || {
+            let result = cached_answer(&query, &fixture, &[ip], 30_000).unwrap();
+            assert_eq!(&result.reply[..2], &0x1234u16.to_be_bytes());
+            tx.send(result.reply).unwrap();
+        });
+        let reply = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cached DNS waited for network work");
+        assert_eq!(answer_addrs(&reply), vec![IpAddr::V4(ip)]);
+        let query = build_query(name, 0x5678);
+        let cached = cached_answer(&query, &state, &[ip], 30_001).unwrap();
+        assert_eq!(&cached.reply[..2], &0x5678u16.to_be_bytes());
+        state.record(&key, Err(()), 30_002);
+        assert!(cached_answer(&query, &state, &[ip], 30_003).is_none());
+        state.record(&key, Ok(20), 40_000);
+        state.note_used(&key, 40_000);
+        state.region_refusal("fixture", Some(name), Some(&key.route), 40_001);
+        assert!(cached_answer(&query, &state, &[ip], 40_002).is_none());
+    }
+
+    #[test]
+    fn dns_grace_expires_and_never_crosses_host_or_network_invalidation() {
+        let ip = Ipv4Addr::new(192, 0, 2, 11);
+        let name = "bounded-dns-grace.test";
+        let key = super::super::route_health::Key::ip(name, (ip, 443).into());
+        let mut state = super::super::route_health::State::default();
+        state.record(&key, Ok(20), 1000);
+        assert!(cached_answer(&build_query("other-host.test", 1), &state, &[ip], 1001).is_none());
+        let query = build_query(name, 1);
+        assert!(cached_answer(&query, &state, &[ip], 121_000).is_none());
+        state.invalidate_probes();
+        assert!(cached_answer(&query, &state, &[ip], 1001).is_none());
+    }
 
     #[test]
     fn relay_keeps_ranked_routes_when_external_dns_only_passes_through() {
