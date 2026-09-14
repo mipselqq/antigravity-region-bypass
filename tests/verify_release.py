@@ -43,6 +43,11 @@ with tempfile.TemporaryDirectory(prefix="ag diagnostics ") as temporary:
     assert result.returncode == 0, result
     reports = list(destination.glob("antigravity-diagnostics-*.json"))
     assert len(reports) == 1, reports
+    output_lines = result.stdout.splitlines()
+    saved_line = next(i for i, line in enumerate(output_lines) if line.strip() == "Диагностика сохранена:")
+    displayed_path = output_lines[saved_line + 1].strip()
+    assert not displayed_path.startswith("\\\\?\\"), displayed_path
+    assert Path(displayed_path).samefile(reports[0]), displayed_path
     report = json.loads(reports[0].read_text(encoding="utf-8"))
     assert report["schema_version"] == 1 and report["bypass_version"] == version, report
     assert report["model_access"].startswith("not_tested"), report

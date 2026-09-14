@@ -1,5 +1,27 @@
 use std::path::{Path, PathBuf};
 
+/// User-facing spelling only; filesystem operations retain the original path.
+pub fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(disk) = text.strip_prefix(r"\\?\") {
+            let bytes = disk.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+            {
+                return disk.to_owned();
+            }
+        }
+    }
+    text.into_owned()
+}
+
 pub fn expand_env_vars(input: &str) -> PathBuf {
     #[cfg(target_os = "windows")]
     {

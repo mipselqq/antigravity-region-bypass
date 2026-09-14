@@ -2,7 +2,7 @@ use crate::core::detector::{find_installations, find_targets_in_path, FoundTarge
 use crate::core::patcher::{patch_target, restore_target};
 use crate::core::v8_cache::clear_ide_v8_caches;
 use crate::net::{apply_dns_rules, remove_dns_rules};
-use crate::system::env::{expand_env_vars, mask_path};
+use crate::system::env::{display_path, expand_env_vars, mask_path};
 use crate::ui::dashboard::{banner, print_dashboard};
 use crate::ui::terminal::{clear_screen, pause, prompt};
 use std::path::Path;
@@ -396,10 +396,6 @@ pub fn handle_rollback() -> bool {
     if ok {
         println!("  \x1b[92m✓\x1b[0m Настройки подключения восстановлены");
         println!("\n  \x1b[92mОбход отключён. Можно открыть Antigravity.\x1b[0m");
-        if crate::net::socket::legacy_tcp_pending() {
-            println!("\n  Примечание: старые настройки сети из предыдущей версии сохранены.");
-            println!("  Текущий обход отключён; эти старые настройки не сбрасывались.");
-        }
     } else {
         eprintln!("\n  Не всё удалось восстановить. Резервные копии сохранены.");
         print_error_details();
@@ -443,10 +439,6 @@ pub fn handle_diagnostics() -> bool {
     }
     println!("\n  Проверена сеть. Доступ к моделям и аккаунту этой проверкой не подтверждается.");
     println!("  Откройте Antigravity и отправьте короткий запрос нужной модели.");
-    if crate::net::socket::legacy_tcp_pending() {
-        println!("\n  Сохранены старые настройки сети из предыдущей версии.");
-        println!("  Они не относятся к текущему включению обхода.");
-    }
     for report in &reports {
         crate::net::relay::log_event(&format!("Диагностика: {report:?}"));
     }
@@ -470,10 +462,8 @@ pub fn handle_save_diagnostics(directory: Option<&std::path::Path>) -> bool {
     println!("  Отчёт сохраняется локально; тексты переписок и токены не включаются.");
     let ok = match crate::diagnostics::save(directory) {
         Ok(path) => {
-            println!("\n  Диагностика сохранена: {}", path.display());
-            println!("  Этот JSON-файл можно приложить к Issue.");
-            println!("  Он содержит IP серверов и локальных шлюзов. Ничего не отправляется автоматически.");
-            println!("  Доступ к модели проверьте отдельным запросом в Antigravity.");
+            println!("\n  Диагностика сохранена:\n  {}", display_path(&path));
+            println!("\n  Файл можно приложить к Issue.");
             true
         }
         Err(error) => {
@@ -498,10 +488,9 @@ pub fn run_app() {
         println!("  \x1b[96m[5]\x1b[0m  Проверить подключение");
         println!("  \x1b[91m[6]\x1b[0m  Отключить обход");
         println!("  [7]  Сохранить диагностику");
-        println!("  [8]  Режим прямого подключения");
         println!("\n  [0]  Выход\n");
 
-        match prompt("Выберите действие [0-8]: ").as_str() {
+        match prompt("Выберите действие [0-7]: ").as_str() {
             "1" => {
                 handle_unlock_all();
             }
@@ -520,10 +509,6 @@ pub fn run_app() {
             }
             "7" => {
                 handle_save_diagnostics(None);
-            }
-            "8" => {
-                super::speed::run();
-                pause();
             }
             "0" => {
                 clear_screen();
