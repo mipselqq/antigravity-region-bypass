@@ -41,6 +41,14 @@ pub fn spawn_background(manage_system: bool) {
         let mut seen_revision = 0;
         let mut last_network = None;
         loop {
+            let configuration = match super::configuration_lock() {
+                Ok(lock) => lock,
+                Err(e) => {
+                    relay::log_event(&e);
+                    thread::sleep(WATCH_EVERY);
+                    continue;
+                }
+            };
             let changed_network = refresh_interface(&mut last_network);
             let stale = file_age().map(|a| a >= FULL_EVERY).unwrap_or(true);
             let leader_dead = any_path_dead();
@@ -90,6 +98,7 @@ pub fn spawn_background(manage_system: bool) {
                 // VPN may have wiped /32s; cheap to re-pin current proxy IPs.
                 refresh_routes_from_disk();
             }
+            drop(configuration);
             for host in NRPT_AGENT {
                 let _ = resolvers::resolve_best(
                     &super::client::build_query(host, 0xB712),
@@ -123,6 +132,7 @@ fn refresh_interface(last: &mut Option<(u32, Option<String>)>) -> bool {
 }
 
 pub fn rescan_agent(if_index: u32) -> Result<Vec<RankedHost>, String> {
+    // The caller holds configuration_lock across all foreground setup stages.
     rescan(if_index, true)
 }
 
