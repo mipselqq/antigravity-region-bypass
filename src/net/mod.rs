@@ -52,11 +52,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("network-update.lock");
         let foreground = super::lock_configuration_file(&path).unwrap();
+        // A concurrent process launch on Unix may temporarily retain a duplicate
+        // descriptor until exec. Releasing the guard must not wait for that copy.
+        let inherited = foreground.0.try_clone().unwrap();
         assert!(super::lock_configuration_file(&path).is_err());
         drop(foreground);
         let background = super::lock_configuration_file(&path).unwrap();
         assert!(super::lock_configuration_file(&path).is_err());
         drop(background);
+        drop(inherited);
         assert!(path.exists());
         assert!(super::lock_configuration_file(&path).is_ok());
     }
@@ -90,13 +94,23 @@ pub struct NetworkSetup {
 /// Serialize foreground setup and background OS/configuration writers. The DNS
 /// request workers deliberately do not take this lock, so existing routes work
 /// while replacement candidates are being discovered.
-pub(super) fn configuration_lock() -> Result<std::fs::File, String> {
+pub(super) struct ConfigurationLock(std::fs::File);
+
+impl Drop for ConfigurationLock {
+    fn drop(&mut self) {
+        // Close alone can leave flock held by a descriptor inherited during fork.
+        // Only this guard owns the critical section; explicitly end it before close.
+        let _ = self.0.unlock();
+    }
+}
+
+pub(super) fn configuration_lock() -> Result<ConfigurationLock, String> {
     let dir = relay::log_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     lock_configuration_file(&dir.join("network-update.lock"))
 }
 
-fn lock_configuration_file(path: &std::path::Path) -> Result<std::fs::File, String> {
+fn lock_configuration_file(path: &std::path::Path) -> Result<ConfigurationLock, String> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -109,7 +123,7 @@ fn lock_configuration_file(path: &std::path::Path) -> Result<std::fs::File, Stri
             "Настройки сети уже обновляются другим процессом. Повторите после завершения обновления.".to_string(),
         other => format!("Блокировка настройки сети: {other}"),
     })?;
-    Ok(file)
+    Ok(ConfigurationLock(file))
 }
 
 pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
