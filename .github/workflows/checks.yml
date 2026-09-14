@@ -41,3 +41,7 @@ jobs:
         run: python tests/verify_wrappers.py
       - name: macOS bundle format
         run: python tests/verify_macos_bundle.py
+      - name: Build executable for read-only smoke checks
+        run: cargo build --locked --bin antigravity-bypass-russia --target ${{ matrix.target }}
+      - name: Read-only CLI and diagnostic export
+        run: python tests/verify_release.py target/${{ matrix.target }}/debug/antigravity-bypass-russia${{ runner.os == 'Windows' && '.exe' || '' }}

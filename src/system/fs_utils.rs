@@ -1,5 +1,3 @@
-#[allow(unused_imports)]
-use std::process::Command;
 use std::{fs, io::Write, path::Path};
 
 /// Never truncate the destination on a failed replacement.
@@ -48,15 +46,16 @@ pub fn post_write_hook(path: &Path) -> Result<(), String> {
         });
         let path_str = path.to_str().unwrap_or_default();
         if is_macho_target {
-            let res = Command::new("codesign")
-                .args([
+            let res = crate::system::command::output(
+                "codesign",
+                [
                     "--force",
                     "--sign",
                     "-",
                     "--preserve-metadata=entitlements,requirements,flags",
                     path_str,
-                ])
-                .output();
+                ],
+            );
             let res = res.map_err(|e| format!("codesign: {e}"))?;
             if !res.status.success() {
                 return Err(format!(
@@ -64,10 +63,9 @@ pub fn post_write_hook(path: &Path) -> Result<(), String> {
                     String::from_utf8_lossy(&res.stderr).trim()
                 ));
             }
-            let verify = Command::new("/usr/bin/codesign")
-                .args(["--verify", "--strict", path_str])
-                .output()
-                .map_err(|e| e.to_string())?;
+            let verify =
+                crate::system::command::output("codesign", ["--verify", "--strict", path_str])
+                    .map_err(|e| e.to_string())?;
             if !verify.status.success() {
                 return Err(format!(
                     "Проверка подписи службы: {}",
@@ -75,16 +73,14 @@ pub fn post_write_hook(path: &Path) -> Result<(), String> {
                 ));
             }
         }
-        let _ = Command::new("xattr")
-            .args(["-d", "com.apple.quarantine", path_str])
-            .output();
+        let _ = crate::system::command::output("xattr", ["-d", "com.apple.quarantine", path_str]);
 
         // Clear quarantine recursively without re-signing the entire .app with --deep
         let mut curr = path.parent();
         while let Some(p) = curr {
             if p.extension().and_then(|e| e.to_str()) == Some("app") {
                 let app_str = p.to_str().unwrap_or_default();
-                let _ = Command::new("xattr").args(["-cr", app_str]).output();
+                let _ = crate::system::command::output("xattr", ["-cr", app_str]);
                 break;
             }
             curr = p.parent();

@@ -219,27 +219,33 @@ fn prepare_for_write(path: &Path, data: Vec<u8>, kind: TargetKind) -> Result<Vec
         let mut temp =
             tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(|e| e.to_string())?;
         temp.write_all(&data).map_err(|e| e.to_string())?;
-        let status = std::process::Command::new("codesign")
-            .args([
+        let status = crate::system::command::output(
+            "codesign",
+            [
                 "--force",
                 "--sign",
                 "-",
                 "--preserve-metadata=entitlements,requirements,flags",
-            ])
-            .arg(temp.path())
-            .output()
-            .map_err(|e| e.to_string())?;
+            ]
+            .into_iter()
+            .map(std::ffi::OsStr::new)
+            .chain([temp.path().as_os_str()]),
+        )
+        .map_err(|e| e.to_string())?;
         if !status.status.success() {
             return Err(format!(
                 "Не удалось подписать временную копию; оригинал сохранён: {}",
                 String::from_utf8_lossy(&status.stderr).trim()
             ));
         }
-        let verified = std::process::Command::new("/usr/bin/codesign")
-            .args(["--verify", "--strict"])
-            .arg(temp.path())
-            .output()
-            .map_err(|e| e.to_string())?;
+        let verified = crate::system::command::output(
+            "codesign",
+            ["--verify", "--strict"]
+                .into_iter()
+                .map(std::ffi::OsStr::new)
+                .chain([temp.path().as_os_str()]),
+        )
+        .map_err(|e| e.to_string())?;
         if !verified.status.success() {
             return Err(format!(
                 "Подпись временной копии не прошла проверку: {}",

@@ -1,6 +1,7 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # One patch/settings implementation on every platform: the Rust engine.
 set -euo pipefail
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 case "$(uname -s):$(uname -m)" in
@@ -8,6 +9,8 @@ case "$(uname -s):$(uname -m)" in
   Darwin:x86_64) release_name=antigravity-bypass-russia-macos-x64 ;;
   *) release_name=antigravity-bypass-russia ;;
 esac
+# A downloaded engine beside this launcher takes precedence over old builds.
+if [[ -x "$script_dir/$release_name" ]]; then exec "$script_dir/$release_name" "$@"; fi
 if [[ -f "$repo_root/Cargo.toml" ]] && command -v cargo >/dev/null 2>&1; then
   cargo build --release --locked --manifest-path "$repo_root/Cargo.toml"
 fi

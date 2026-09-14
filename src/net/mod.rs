@@ -19,11 +19,9 @@ pub mod split_dns;
 
 pub use relay::{detach_console, log_fatal, run as run_dns_relay};
 
-use crate::system::process::no_window;
 use provider::{nrpt_domains, NRPT_AGENT, NRPT_STUDIO, NRPT_TAG, SUBSTITUTION_CANARIES};
 use relay::{LISTEN_IP, LISTEN_PORT};
 use routes::{add_static_routes, remove_static_routes};
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -84,6 +82,34 @@ pub fn preflight() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     split_dns::preflight(std::path::Path::new("/etc/resolver"), &nrpt_domains())?;
     Ok(())
+}
+
+pub(super) fn flush_dns_cache() -> Result<(), String> {
+    #[cfg(windows)]
+    let commands: &[(&str, &[&str])] = &[("ipconfig", &["/flushdns"])];
+    #[cfg(target_os = "macos")]
+    let commands: &[(&str, &[&str])] = &[
+        ("dscacheutil", &["-flushcache"]),
+        ("killall", &["-HUP", "mDNSResponder"]),
+    ];
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let commands: &[(&str, &[&str])] = &[];
+    let mut errors = Vec::new();
+    for (program, args) in commands {
+        match crate::system::command::output(program, *args) {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => errors.push(format!("{program}: {}", out.status)),
+            Err(error) => errors.push(format!("{program}: {error}")),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Не удалось обновить кэш DNS: {}",
+            errors.join("; ")
+        ))
+    }
 }
 
 pub struct NetworkSetup {
@@ -260,19 +286,13 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
             return Err(format!("NRPT: записано {count}/{} правил", rules.len()));
         }
         crate::net::nrpt::verify_effective(&rules)?;
-        let _ = no_window(&mut Command::new("ipconfig"))
-            .arg("/flushdns")
-            .output();
     }
 
     #[cfg(target_os = "macos")]
     {
         split_dns::apply(std::path::Path::new("/etc/resolver"), &rules)?;
-        let _ = Command::new("dscacheutil").arg("-flushcache").output();
-        let _ = Command::new("killall")
-            .args(["-HUP", "mDNSResponder"])
-            .output();
     }
+    flush_dns_cache()?;
 
     let mut msg = if relay_ok {
         format!("Сеть настроена (релей {}:{})", LISTEN_IP, LISTEN_PORT)
@@ -396,9 +416,6 @@ fn remove_dns_configuration(restore_tcp: bool) -> Result<(), String> {
         if crate::net::nrpt::get_nrpt_status_info().0 != 0 {
             errors.push("Не все правила NRPT удалены".into());
         }
-        let _ = no_window(&mut Command::new("ipconfig"))
-            .arg("/flushdns")
-            .output();
     }
     #[cfg(target_os = "macos")]
     {
@@ -406,10 +423,9 @@ fn remove_dns_configuration(restore_tcp: bool) -> Result<(), String> {
             std::path::Path::new("/etc/resolver"),
             &nrpt_domains(),
         ));
-        let _ = Command::new("dscacheutil").arg("-flushcache").output();
-        let _ = Command::new("killall")
-            .args(["-HUP", "mDNSResponder"])
-            .output();
+    }
+    if let Err(error) = flush_dns_cache() {
+        errors.push(error);
     }
     resolvers::invalidate_network_caches();
     if errors.is_empty() {

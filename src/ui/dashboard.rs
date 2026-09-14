@@ -17,7 +17,7 @@ pub fn banner() {
 
 pub fn print_dashboard() {
     let (rules, _, _) = crate::net::nrpt::get_nrpt_status_info();
-    let running = crate::system::service::is_running();
+    let running = crate::system::service::running_state();
     let status = get_quick_status();
     let title = " ТЕКУЩИЙ СТАТУС ";
     let left = (67 - title.chars().count()) / 2;
@@ -29,7 +29,9 @@ pub fn print_dashboard() {
         "─".repeat(right)
     );
     println!("\x1b[90m│{}│\x1b[0m", " ".repeat(67));
-    let network = if rules > 0 && running {
+    let network = if running.is_err() {
+        "\x1b[93mНе удалось проверить службу\x1b[0m"
+    } else if rules > 0 && running == Ok(true) {
         "\x1b[92mВключён\x1b[0m"
     } else if rules > 0 {
         "\x1b[93mНужна проверка\x1b[0m"

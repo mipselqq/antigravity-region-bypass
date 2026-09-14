@@ -7,9 +7,10 @@ import textwrap
 
 
 def bundle(arm64: bytes, x64: bytes) -> str:
-    script = '''#!/usr/bin/env bash
+    script = '''#!/bin/bash
 # Antigravity Bypass Russia: native engines included for Intel and Apple Silicon.
 set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 if [[ "$(uname -s)" != Darwin ]]; then
   printf '%s\\n' 'This launcher is for macOS.' >&2
   exit 1

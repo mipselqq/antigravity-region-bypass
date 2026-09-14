@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory(prefix="ag-bundle-test-") as temp:
             # Test the real decoder on the host with its supported flag.
             + ('base64() { command base64 -d; }\n' if sys.platform != 'darwin' else ''),
             encoding="utf-8", newline="\n")
-        env = dict(os.environ, BASH_ENV=environment.as_posix(), MSYS_NO_PATHCONV="1")
+        env = dict(os.environ, BASH_ENV=environment.as_posix(), MSYS_NO_PATHCONV="1", PATH="")
         result = subprocess.run([bash, str(launcher), "--check", "space and кириллица"], env=env,
                                 capture_output=True, encoding="utf-8", timeout=10)
         assert result.returncode == 7, result

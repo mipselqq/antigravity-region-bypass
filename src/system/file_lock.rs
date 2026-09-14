@@ -212,11 +212,14 @@ fn query(paths: &[PathBuf]) -> Result<Vec<String>, String> {
         if paths.is_empty() {
             return Ok(vec![]);
         }
-        let output = std::process::Command::new("/usr/sbin/lsof")
-            .args(["-n", "-P", "-Fpc", "--"])
-            .args(paths)
-            .output()
-            .map_err(|e| format!("Проверка открытых файлов: {e}"))?;
+        let output = crate::system::command::output(
+            "lsof",
+            ["-n", "-P", "-Fpc", "--"]
+                .into_iter()
+                .map(std::ffi::OsStr::new)
+                .chain(paths.iter().map(|p| p.as_os_str())),
+        )
+        .map_err(|e| format!("Проверка открытых файлов: {e}"))?;
         parse_lsof(
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),

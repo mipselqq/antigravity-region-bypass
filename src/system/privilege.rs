@@ -179,7 +179,7 @@ pub fn ensure_admin() {
 
         let is_tty = unsafe { libc::isatty(0) == 1 };
         if is_tty {
-            let mut cmd = Command::new("sudo");
+            let mut cmd = Command::new("/usr/bin/sudo");
             cmd.arg(current_exe);
             for a in args {
                 cmd.arg(a);
@@ -199,7 +199,9 @@ pub fn ensure_admin() {
                 "do shell script {} with administrator privileges",
                 serde_json::to_string(&command).unwrap()
             );
-            let status = Command::new("osascript").args(["-e", &script]).status();
+            let status = Command::new("/usr/bin/osascript")
+                .args(["-e", &script])
+                .status();
             std::process::exit(if status.is_ok_and(|s| s.success()) {
                 0
             } else {
@@ -213,7 +215,7 @@ pub fn ensure_admin() {
     {
         let current_exe = std::env::current_exe().unwrap_or_default();
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let mut cmd = Command::new("sudo");
+        let mut cmd = Command::new("/usr/bin/sudo");
         cmd.arg(current_exe);
         for a in args {
             cmd.arg(a);

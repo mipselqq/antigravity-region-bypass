@@ -29,11 +29,7 @@ fn powershell(script: &str) -> Result<String, String> {
     let script = format!(
         "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; try {{ & {{ {script} }}; exit 0 }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}"
     );
-    let out = crate::system::powershell::command()
-        .map_err(|e| e.to_string())?
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let out = crate::system::powershell::output(&script).map_err(|e| e.to_string())?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);

@@ -1,6 +1,3 @@
-#[cfg(target_os = "macos")]
-use std::process::Command;
-
 pub struct Egress {
     pub if_index: u32,
     #[allow(dead_code)]
@@ -75,16 +72,7 @@ try {
 
 #[cfg(windows)]
 fn active_virtual_adapters() -> Result<Vec<String>, String> {
-    let output = crate::system::powershell::command()
-        .and_then(|mut cmd| {
-            cmd.args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                TUN_ADAPTER_QUERY,
-            ])
-            .output()
-        })
+    let output = crate::system::powershell::output(TUN_ADAPTER_QUERY)
         .map_err(|e| format!("Не удалось запустить Windows PowerShell для проверки TUN: {e}"))?;
     parse_tun_adapters(output)
 }
@@ -400,11 +388,10 @@ if ($mine.Count -gt 0) {
     Write-Output ("{0}|{1}" -f $best.ifIndex, $best.NextHop)
 }
 "#;
-        let out = crate::system::powershell::command()
-            .ok()?
-            .args(["-NoProfile", "-NonInteractive", "-Command", ps])
-            .output()
-            .ok()?;
+        let out = crate::system::powershell::output(ps).ok()?;
+        if !out.status.success() {
+            return None;
+        }
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if let Some((idx, gw)) = s.split_once('|') {
             if let Ok(i) = idx.trim().parse::<u32>() {
@@ -460,10 +447,7 @@ if ($mine.Count -gt 0) {
 
     #[cfg(target_os = "macos")]
     {
-        let out = Command::new("/sbin/route")
-            .args(["-n", "get", "8.8.8.8"])
-            .output()
-            .ok()?;
+        let out = crate::system::command::output("route", ["-n", "get", "8.8.8.8"]).ok()?;
         if !out.status.success() {
             return None;
         }
@@ -531,10 +515,7 @@ pub fn detect() -> Option<Egress> {
     #[cfg(target_os = "macos")]
     {
         // A VPN can install /1 routes while leaving the physical default intact.
-        let out = Command::new("/sbin/route")
-            .args(["-n", "get", "8.8.8.8"])
-            .output()
-            .ok()?;
+        let out = crate::system::command::output("route", ["-n", "get", "8.8.8.8"]).ok()?;
         if !out.status.success() {
             return None;
         }

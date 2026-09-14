@@ -9,11 +9,7 @@ pub fn expand_env_vars(input: &str) -> PathBuf {
 
         #[link(name = "kernel32")]
         extern "system" {
-            fn ExpandEnvironmentStringsW(
-                lpSrc: *const u16,
-                lpDst: *mut u16,
-                nSize: u32,
-            ) -> u32;
+            fn ExpandEnvironmentStringsW(lpSrc: *const u16, lpDst: *mut u16, nSize: u32) -> u32;
         }
 
         let wide_in: Vec<u16> = OsStr::new(input)
@@ -50,7 +46,9 @@ pub fn expand_env_vars(input: &str) -> PathBuf {
                     }
                 }
                 // When elevated via GUI / osascript, query the active console user
-                if let Ok(out) = std::process::Command::new("stat").args(["-f", "%Su", "/dev/console"]).output() {
+                if let Ok(out) =
+                    crate::system::command::output("stat", ["-f", "%Su", "/dev/console"])
+                {
                     let user = String::from_utf8_lossy(&out.stdout).trim().to_string();
                     if !user.is_empty() && user != "root" {
                         let user_home = PathBuf::from(format!("/Users/{}", user));
@@ -125,7 +123,7 @@ pub fn get_user_homes() -> Vec<PathBuf> {
                     }
                 }
             }
-            if let Ok(out) = std::process::Command::new("stat").args(["-f", "%Su", "/dev/console"]).output() {
+            if let Ok(out) = crate::system::command::output("stat", ["-f", "%Su", "/dev/console"]) {
                 let user = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !user.is_empty() && user != "root" {
                     let p = PathBuf::from(format!("/Users/{}", user));
@@ -148,7 +146,8 @@ pub fn get_user_homes() -> Vec<PathBuf> {
         }
         if let Ok(h) = std::env::var("HOME") {
             let p = PathBuf::from(h);
-            if !homes.contains(&p) && p != PathBuf::from("/var/root") && p != PathBuf::from("/root") {
+            if !homes.contains(&p) && p != PathBuf::from("/var/root") && p != PathBuf::from("/root")
+            {
                 homes.push(p);
             }
         }

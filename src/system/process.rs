@@ -226,14 +226,12 @@ pub fn stop_process_by_name(process_name: &str) {
     {
         let clean_name = process_name.trim_end_matches(".exe");
         let exe_name = format!("{}.exe", clean_name);
-        let _ = no_window(&mut Command::new("taskkill"))
-            .args(["/F", "/T", "/IM", &exe_name])
-            .output();
+        let _ = crate::system::command::output("taskkill", ["/F", "/T", "/IM", &exe_name]);
         stop_processes_by_names(&[clean_name, &exe_name]);
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = Command::new("killall").args(["-9", process_name]).output();
+        let _ = crate::system::command::output("killall", ["-9", process_name]);
     }
 }
 

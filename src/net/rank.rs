@@ -83,16 +83,9 @@ pub fn spawn_background(manage_system: bool) {
                     }
                 }
                 if refused && manage_system {
-                    #[cfg(windows)]
-                    let _ = crate::system::process::no_window(&mut std::process::Command::new(
-                        "ipconfig",
-                    ))
-                    .arg("/flushdns")
-                    .output();
-                    #[cfg(target_os = "macos")]
-                    let _ = std::process::Command::new("dscacheutil")
-                        .arg("-flushcache")
-                        .output();
+                    if let Err(error) = super::flush_dns_cache() {
+                        relay::log_fatal(&error);
+                    }
                 }
             } else if manage_system {
                 // VPN may have wiped /32s; cheap to re-pin current proxy IPs.

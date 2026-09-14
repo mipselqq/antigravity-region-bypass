@@ -326,8 +326,10 @@ fn service_summary() -> Value {
         .as_ref()
         .zip(current.as_ref())
         .map(|(a, b)| a == b);
-    json!({"status": "ok", "registered": system::service::is_enabled(),
-        "process_detected": system::service::is_running(),
+    let registered = system::service::registered_state();
+    let running = system::service::running_state();
+    json!({"status": if registered.is_ok() && running.is_ok() { "ok" } else { "partial" },
+        "registered": registered.ok(), "process_detected": running.ok(),
         "installed_binary_sha256": installed, "current_binary_sha256": current,
         "installed_matches_current": same,
         "note": "process detection alone does not confirm DNS readiness"})

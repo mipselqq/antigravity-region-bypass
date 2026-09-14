@@ -1,3 +1,4 @@
+pub mod command;
 pub mod env;
 pub mod file_lock;
 pub mod fs_utils;

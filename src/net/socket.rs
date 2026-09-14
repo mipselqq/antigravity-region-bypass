@@ -1,7 +1,6 @@
 use std::fs;
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::process::Command;
 
 pub const TCP_BUFFER_SIZE_512K: i32 = 512 * 1024; // 524,288 bytes (512 KB)
 const TCP_BACKUP_NAME: &str = "tcp_backup.conf";
@@ -374,9 +373,8 @@ pub fn get_os_network_status() -> String {
         let mut lines = Vec::new();
         lines.push("OS Network Stack Status (Windows TCP Global Parameters):".to_string());
 
-        if let Ok(output) = crate::system::process::no_window(&mut Command::new("netsh"))
-            .args(["int", "tcp", "show", "global"])
-            .output()
+        if let Ok(output) =
+            crate::system::command::output("netsh", ["int", "tcp", "show", "global"])
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
@@ -436,9 +434,8 @@ pub fn get_os_network_status() -> String {
             }
         }
 
-        if let Ok(output) = crate::system::process::no_window(&mut Command::new("netsh"))
-            .args(["int", "tcp", "show", "heuristics"])
-            .output()
+        if let Ok(output) =
+            crate::system::command::output("netsh", ["int", "tcp", "show", "heuristics"])
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
@@ -484,7 +481,7 @@ pub fn get_os_network_status() -> String {
         ];
 
         for (key, label) in &sysctl_keys {
-            if let Ok(output) = Command::new("sysctl").arg("-n").arg(key).output() {
+            if let Ok(output) = crate::system::command::output("sysctl", ["-n", key]) {
                 let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !val.is_empty() {
                     lines.push(format!("  - {}: {}", label, val));
@@ -558,9 +555,7 @@ fn capture_tcp() -> Result<TcpSnapshot, String> {
     let mut original = std::collections::BTreeMap::new();
     #[cfg(target_os = "windows")]
     {
-        let out = crate::system::process::no_window(&mut Command::new("netsh"))
-            .args(["int", "tcp", "dump"])
-            .output()
+        let out = crate::system::command::output("netsh", ["int", "tcp", "dump"])
             .map_err(|e| e.to_string())?;
         if !out.status.success() {
             return Err("Не удалось сохранить TCP snapshot".into());
@@ -576,10 +571,8 @@ fn capture_tcp() -> Result<TcpSnapshot, String> {
     }
     #[cfg(target_os = "macos")]
     for (key, _) in tcp_tunables() {
-        let out = Command::new("sysctl")
-            .args(["-n", key])
-            .output()
-            .map_err(|e| e.to_string())?;
+        let out =
+            crate::system::command::output("sysctl", ["-n", key]).map_err(|e| e.to_string())?;
         if !out.status.success() {
             return Err(format!("Нет snapshot {key}"));
         }
@@ -619,13 +612,12 @@ fn write_tcp(key: &str, value: &str) -> Result<(), String> {
         return Err("Некорректный TCP snapshot".into());
     }
     #[cfg(target_os = "windows")]
-    let result = crate::system::process::no_window(&mut Command::new("netsh"))
-        .args(["int", "tcp", "set", "global", &format!("{key}={value}")])
-        .output();
+    let result = crate::system::command::output(
+        "netsh",
+        ["int", "tcp", "set", "global", &format!("{key}={value}")],
+    );
     #[cfg(not(target_os = "windows"))]
-    let result = Command::new("sysctl")
-        .args(["-w", &format!("{key}={value}")])
-        .output();
+    let result = crate::system::command::output("sysctl", ["-w", &format!("{key}={value}")]);
     let out = result.map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(())
@@ -784,10 +776,8 @@ fn legacy_tcp_plan(
 
 #[cfg(windows)]
 fn read_legacy_heuristics() -> Option<String> {
-    let output = crate::system::process::no_window(&mut Command::new("netsh"))
-        .args(["int", "tcp", "show", "heuristics"])
-        .output()
-        .ok()?;
+    let output =
+        crate::system::command::output("netsh", ["int", "tcp", "show", "heuristics"]).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -819,10 +809,9 @@ fn restore_legacy_tcp() -> Result<Vec<String>, String> {
                 unresolved.push("heuristics: неподдерживаемое исходное значение".into());
                 continue;
             }
-            let output = crate::system::process::no_window(&mut Command::new("netsh"))
-                .args(["int", "tcp", "set", "heuristics", value])
-                .output()
-                .map_err(|e| e.to_string())?;
+            let output =
+                crate::system::command::output("netsh", ["int", "tcp", "set", "heuristics", value])
+                    .map_err(|e| e.to_string())?;
             if !output.status.success() {
                 unresolved.push("heuristics: запись не выполнена".into());
             }

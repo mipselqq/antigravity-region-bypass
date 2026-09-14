@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-ARGUMENTS = ["patch-files", "C:/Example Folder/путь", "--check"]
+ARGUMENTS = ["patch-files", "C:/Example Folder/путь", "--check", 'a"b', "", "C:\\Folder with space\\"]
 
 
 def run(command):
@@ -14,11 +14,22 @@ def run(command):
 
 
 with tempfile.TemporaryDirectory(prefix="ag wrapper ") as temporary:
-    folder = Path(temporary)
+    folder = Path(temporary) / "download with space"
+    folder.mkdir()
     source = folder / "probe.rs"
     source.write_text('fn main() { for a in std::env::args().skip(1) { println!("{}", a.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>()); } std::process::exit(7); }')
     binary = folder / ("antigravity-bypass-russia.exe" if os.name == "nt" else "antigravity-bypass-russia")
     subprocess.run(["rustc", str(source), "-o", str(binary)], check=True, timeout=90)
+
+    # This older adjacent repository build must never override the downloaded engine.
+    stale_dir = Path(temporary) / "target" / "release"
+    stale_dir.mkdir(parents=True)
+    stale_source = folder / "stale.rs"
+    stale_source.write_text('fn main() { println!("stale engine"); std::process::exit(19); }')
+    stale_binary = stale_dir / binary.name
+    subprocess.run(["rustc", str(stale_source), "-o", str(stale_binary)], check=True, timeout=90)
+    if os.name == "nt":
+        shutil.copyfile(stale_binary, stale_dir / "antigravity-bypass-russia")
 
     if os.name == "nt":
         wrapper = folder / "unlock_and_restore.ps1"
@@ -51,9 +62,12 @@ with tempfile.TemporaryDirectory(prefix="ag wrapper ") as temporary:
         assert result.returncode == 0, result.stderr
         # Git Bash rewrites /-prefixed arguments for native programs unless disabled.
         os.environ["MSYS_NO_PATHCONV"] = "1"
-        result = run([bash, str(wrapper), *ARGUMENTS])
+        # Full POSIX quoting is verified with native engines on macOS CI.
+        # Git Bash has an extra MSYS-to-Windows command-line translation layer.
+        bash_arguments = ARGUMENTS[:3] if os.name == "nt" else ARGUMENTS
+        result = run([bash, str(wrapper), *bash_arguments])
         assert result.returncode == 7, (result.returncode, result.stdout, result.stderr)
-        assert result.stdout.splitlines() == [a.encode("utf-8").hex() for a in ARGUMENTS], result.stdout
+        assert result.stdout.splitlines() == [a.encode("utf-8").hex() for a in bash_arguments], result.stdout
         print("PASS: Bash syntax, arguments and failure exit code")
     else:
         print("SKIP: Bash not installed")

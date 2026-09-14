@@ -840,11 +840,7 @@ try {{
 #[cfg(target_os = "windows")]
 pub fn verify_effective(rules: &[(String, String)]) -> Result<(), String> {
     let script = effective_check_script(rules)?;
-    let out = crate::system::powershell::command()
-        .map_err(|e| e.to_string())?
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let out = crate::system::powershell::output(&script).map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!(
             "Эффективная NRPT не подтверждена: {}",
