@@ -7,6 +7,75 @@ use crate::ui::dashboard::{banner, print_dashboard};
 use crate::ui::terminal::{clear_screen, pause, prompt};
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileSetupOutcome {
+    // Cancellation, missing targets, or a failed application-close check.
+    Stopped,
+    // All targets were attempted; individual files may have failed.
+    Completed(bool),
+}
+
+impl FileSetupOutcome {
+    fn succeeded(self) -> bool {
+        matches!(self, Self::Completed(true))
+    }
+}
+
+fn continue_setup(outcome: FileSetupOutcome, next: impl FnOnce() -> bool) -> FileSetupOutcome {
+    match outcome {
+        FileSetupOutcome::Stopped => FileSetupOutcome::Stopped,
+        FileSetupOutcome::Completed(ok) => {
+            // Run the next stage even after partial failure, preserving that failure.
+            FileSetupOutcome::Completed(next() && ok)
+        }
+    }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::{continue_setup, FileSetupOutcome};
+
+    #[test]
+    fn cancelled_or_blocked_file_setup_skips_all_following_mutations() {
+        let outcome = continue_setup(FileSetupOutcome::Stopped, || {
+            panic!("Cancelled setup must not clear caches or change endpoints")
+        });
+        let outcome = continue_setup(outcome, || {
+            panic!("Cancelled setup must not configure DNS or install a service")
+        });
+        assert_eq!(outcome, FileSetupOutcome::Stopped);
+        assert!(!outcome.succeeded());
+    }
+
+    #[test]
+    fn partial_setup_runs_remaining_stages_in_order_and_keeps_every_failure() {
+        for files_ok in [false, true] {
+            for side_ok in [false, true] {
+                for network_ok in [false, true] {
+                    let mut stages = vec!["patch files"];
+                    let outcome = continue_setup(FileSetupOutcome::Completed(files_ok), || {
+                        stages.push("clear caches and configure endpoints");
+                        side_ok
+                    });
+                    let outcome = continue_setup(outcome, || {
+                        stages.push("configure DNS and refresh endpoints");
+                        network_ok
+                    });
+                    assert_eq!(
+                        stages,
+                        [
+                            "patch files",
+                            "clear caches and configure endpoints",
+                            "configure DNS and refresh endpoints"
+                        ]
+                    );
+                    assert_eq!(outcome.succeeded(), files_ok && side_ok && network_ok);
+                }
+            }
+        }
+    }
+}
+
 fn print_error_details() {
     println!(
         "  Подробности для поддержки: {}",
@@ -60,18 +129,18 @@ fn patch_root(root: &Path) -> bool {
         eprintln!("[✗] Нет поддерживаемых целей: {}", mask_path(root));
         return false;
     }
-    patch_targets(targets)
+    patch_targets(targets).succeeded()
 }
-fn patch_targets(targets: Vec<FoundTarget>) -> bool {
+fn patch_targets(targets: Vec<FoundTarget>) -> FileSetupOutcome {
     let paths: Vec<_> = targets.iter().map(|target| target.path.clone()).collect();
     if !ensure_application_closed(&paths, "включение обхода") {
-        return false;
+        return FileSetupOutcome::Stopped;
     }
     let mut ok = true;
     for t in targets {
         ok &= print_patch_result(&t, patch_target(&t));
     }
-    ok
+    FileSetupOutcome::Completed(ok)
 }
 fn apply_files_side() -> bool {
     let _ = clear_ide_v8_caches();
@@ -87,11 +156,11 @@ fn apply_files_side() -> bool {
     }
     ok
 }
-fn patch_installations() -> bool {
+fn patch_installations() -> FileSetupOutcome {
     let installs = find_installations();
     if installs.is_empty() {
         eprintln!("[✗] Установки не найдены; укажите путь в пункте 4.");
-        return false;
+        return FileSetupOutcome::Stopped;
     }
     let targets: Vec<_> = installs
         .iter()
@@ -99,12 +168,10 @@ fn patch_installations() -> bool {
         .collect();
     if targets.is_empty() {
         eprintln!("[✗] Файлы приложения не найдены; укажите путь в пункте 4.");
-        return false;
+        return FileSetupOutcome::Stopped;
     }
-    if !patch_targets(targets) {
-        return false;
-    }
-    apply_files_side()
+    // Successful JS patches need their old V8 caches cleared even if another file failed.
+    continue_setup(patch_targets(targets), apply_files_side)
 }
 fn show_result(ok: bool) {
     if ok {
@@ -121,31 +188,30 @@ pub fn handle_unlock_all() -> bool {
     if !check_vpn_before_setup() {
         return false;
     }
-    if !patch_installations() {
-        show_result(false);
-        pause();
-        return false;
-    }
-    let mut ok = true;
-    match apply_dns_rules() {
-        Ok(msg) => {
-            crate::net::relay::log_event(&msg);
-            println!("  \x1b[92m✓\x1b[0m Обход через DNS настроен");
-            for note in crate::core::endpoint::apply_all() {
-                match note {
-                    Ok(msg) => crate::net::relay::log_event(&msg),
-                    Err(e) => {
-                        operation_error("Не удалось завершить настройку", &e);
-                        ok = false;
+    let outcome = continue_setup(patch_installations(), || {
+        let mut ok = true;
+        match apply_dns_rules() {
+            Ok(msg) => {
+                crate::net::relay::log_event(&msg);
+                println!("  \x1b[92m✓\x1b[0m Обход через DNS настроен");
+                for note in crate::core::endpoint::apply_all() {
+                    match note {
+                        Ok(msg) => crate::net::relay::log_event(&msg),
+                        Err(e) => {
+                            operation_error("Не удалось завершить настройку", &e);
+                            ok = false;
+                        }
                     }
                 }
             }
+            Err(e) => {
+                operation_error("Не удалось настроить подключение", &e);
+                ok = false;
+            }
         }
-        Err(e) => {
-            operation_error("Не удалось настроить подключение", &e);
-            ok = false;
-        }
-    }
+        ok
+    });
+    let ok = outcome.succeeded();
     show_result(ok);
     pause();
     ok
@@ -154,7 +220,7 @@ pub fn handle_patch_files_only() -> bool {
     let ok = if let Some(path) = std::env::args().nth(2) {
         patch_root(&expand_env_vars(&path))
     } else {
-        patch_installations()
+        patch_installations().succeeded()
     };
     show_result(ok);
     pause();

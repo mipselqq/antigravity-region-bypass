@@ -119,6 +119,12 @@ fn plan_binary(data: &[u8], kind: TargetKind) -> Result<Plan, String> {
             CLI_GATE_X64_LONG_FIX,
             "agy-x64-long-v1",
         ),
+        (TargetKind::AgyCli, Architecture::Aarch64) => (
+            regex_mgr_arm64_orig(),
+            regex_mgr_arm64_patched(),
+            MGR_GATE_ARM64_FIX,
+            "agy-arm64-v1",
+        ),
         _ => return Err("Нет профиля патча для этой архитектуры/компонента".into()),
     };
     let mut output = data.to_vec();
@@ -363,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn macho_core_profiles_support_both_architectures_and_reject_unknown_cli() {
+    fn macho_core_profiles_support_both_architectures_and_reject_unknown_x64_cli() {
         let x64 = b"\x80\x78\x08\x00\x74\x0a\x48\x8b\x44\x24\x20\x48\x89\x44\x60";
         let arm64 = b"\x03\x20\x40\x39\x03\x00\x00\x36\x00\x00\x00\x00\x03\x10\x06\xa9";
         for (code, cpu) in [(x64.as_slice(), 0x01000007), (arm64.as_slice(), 0x0100000c)] {
@@ -375,7 +381,7 @@ mod tests {
             assert_eq!((repeated.changes, repeated.existing), (0, 1));
             assert_eq!(repeated.data, patched.data);
         }
-        assert!(plan_binary(&macho_fixture(arm64, 0x0100000c), TargetKind::AgyCli).is_err());
+        assert!(plan_binary(&macho_fixture(x64, 0x01000007), TargetKind::AgyCli).is_err());
         let cli = b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85";
         assert_eq!(
             plan_binary(&macho_fixture(cli, 0x01000007), TargetKind::AgyCli)
@@ -383,6 +389,52 @@ mod tests {
                 .changes,
             1
         );
+    }
+
+    #[test]
+    fn macho_arm64_cli_patch_is_exact_and_idempotent() {
+        // Exercise both supported instruction gaps and every TBZ immediate prefix.
+        for branch in [0x03, 0x23, 0x43, 0x63, 0x83, 0xa3, 0xc3, 0xe3] {
+            for gap in [1, 2] {
+                let mut code = vec![0x03, 0x20, 0x40, 0x39, branch, 0x0a, 0x00, 0x36];
+                for _ in 0..gap {
+                    code.extend_from_slice(b"\x1f\x20\x03\xd5"); // NOP
+                }
+                code.extend_from_slice(b"\x03\x10\x06\xa9");
+                let mut original = macho_fixture(&code, 0x0100000c);
+                // A matching sequence outside __text must remain untouched.
+                original[800..800 + code.len()].copy_from_slice(&code);
+                let patched = plan_binary(&original, TargetKind::AgyCli).unwrap();
+                assert_eq!(patched.profile, "agy-arm64-v1");
+                assert_eq!((patched.changes, patched.existing), (1, 0));
+                let mut expected = original;
+                expected[512..520].copy_from_slice(b"\x23\x00\x80\x52\x03\x20\x00\x39");
+                assert_eq!(patched.data, expected);
+                let repeated = plan_binary(&patched.data, TargetKind::AgyCli).unwrap();
+                assert_eq!((repeated.changes, repeated.existing), (0, 1));
+                assert_eq!(repeated.data, patched.data);
+            }
+        }
+    }
+
+    #[test]
+    fn macho_arm64_cli_rejects_missing_ambiguous_and_wrong_architecture_gates() {
+        let code = b"\x03\x20\x40\x39\x03\x00\x00\x36\x1f\x20\x03\xd5\x03\x10\x06\xa9";
+        let stock = macho_fixture(code, 0x0100000c);
+        let patched = plan_binary(&stock, TargetKind::AgyCli).unwrap();
+        let patched_code = &patched.data[512..512 + code.len()];
+        for unsupported in [
+            vec![0u8; code.len()],
+            code[..code.len() - 1].to_vec(),
+            [code.as_slice(), code.as_slice()].concat(),
+            [code.as_slice(), patched_code].concat(),
+            [patched_code, patched_code].concat(),
+        ] {
+            assert!(
+                plan_binary(&macho_fixture(&unsupported, 0x0100000c), TargetKind::AgyCli).is_err()
+            );
+        }
+        assert!(plan_binary(&macho_fixture(code, 0x01000007), TargetKind::AgyCli).is_err());
     }
 
     fn pe_fixture(code: &[u8], machine: u16) -> Vec<u8> {
