@@ -105,6 +105,28 @@ pub fn has_record(path: &Path) -> bool {
     record_path(path).is_file()
 }
 
+pub fn verify_recorded_file(path: &Path) -> Result<bool, String> {
+    let Some(bytes) = read_optional(&record_path(path))? else {
+        return Ok(false);
+    };
+    let record = parse_record(&bytes)?;
+    let current = read_optional(path)?;
+    if current.as_ref().is_some_and(|bytes| {
+        let hash = digest(bytes);
+        hash == record.modified
+            || hash == record.original
+            || record.previous.as_ref() == Some(&hash)
+    }) || (!record.existed && current.is_none())
+    {
+        Ok(true)
+    } else {
+        Err(format!(
+            "{} изменён после настройки; пользовательские изменения сохранены",
+            path.display()
+        ))
+    }
+}
+
 /// Preserve legacy configuration before removing a known override. This is an
 /// archive, not an active patch record: another rollback must not reapply it.
 pub fn archive_legacy(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {

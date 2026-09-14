@@ -64,6 +64,49 @@ pub fn remove_entries() -> Result<(), String> {
     Ok(())
 }
 
+pub fn owned_entries() -> Result<Vec<(String, Ipv4Addr)>, String> {
+    match fs::read_to_string(hosts_path()) {
+        Ok(text) => parse_owned_entries(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(format!("Чтение hosts: {e}")),
+    }
+}
+
+fn parse_owned_entries(text: &str) -> Result<Vec<(String, Ipv4Addr)>, String> {
+    strip_block(text)?; // Refuse damaged boundaries rather than guessing ownership.
+    let mut entries = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        match line.trim() {
+            START_MARK => inside = true,
+            END_MARK => inside = false,
+            _ if inside => {
+                let mut fields = line.split('#').next().unwrap_or("").split_whitespace();
+                let Some(ip) = fields.next().and_then(|ip| ip.parse::<Ipv4Addr>().ok()) else {
+                    continue;
+                };
+                for host in fields {
+                    let host = super::route_health::host_name(host);
+                    if !super::provider::NRPT_AGENT.contains(&host.as_str()) {
+                        continue;
+                    }
+                    if entries
+                        .iter()
+                        .any(|(name, previous)| name == &host && previous != &ip)
+                    {
+                        return Err(format!("Неоднозначные адреса {host} в блоке hosts"));
+                    }
+                    if !entries.contains(&(host.clone(), ip)) {
+                        entries.push((host, ip));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(entries)
+}
+
 fn strip_block(text: &str) -> Result<String, String> {
     let mut result = String::new();
     let mut in_block = false;
@@ -87,6 +130,34 @@ fn strip_block(text: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_unambiguous_owned_agent_entries_can_identify_a_refused_route() {
+        let unmanaged = "192.0.2.9 cloudcode-pa.googleapis.com\n";
+        assert!(parse_owned_entries(unmanaged).unwrap().is_empty());
+        let text = format!("{unmanaged}{START_MARK}\n192.0.2.1 CLOUDCODE-PA.GOOGLEAPIS.COM # keep\n192.0.2.2 unrelated.test\n{END_MARK}\n");
+        assert_eq!(
+            parse_owned_entries(&text).unwrap(),
+            vec![(
+                "cloudcode-pa.googleapis.com".into(),
+                "192.0.2.1".parse().unwrap()
+            )]
+        );
+        let conflicting = text.replace(
+            END_MARK,
+            &format!("192.0.2.3 cloudcode-pa.googleapis.com\n{END_MARK}"),
+        );
+        assert!(parse_owned_entries(&conflicting).is_err());
+        assert!(parse_owned_entries(&text.replace(END_MARK, "")).is_err());
+    }
+
+    #[test]
+    fn stale_hosts_update_preserves_concurrent_edit_on_every_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        fs::write(&path, "user changed this").unwrap();
+        assert!(safe_write_hosts(&path, b"old", b"replacement").is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "user changed this");
+    }
     #[test]
     fn removing_owned_block_preserves_unmanaged_bytes_and_user_additions() {
         for original in [
@@ -144,6 +215,14 @@ mod tests {
 }
 
 fn safe_write_hosts(path: &Path, _expected: &[u8], data: &[u8]) -> Result<(), String> {
+    let current = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && _expected.is_empty() => vec![],
+        Err(e) => return Err(e.to_string()),
+    };
+    if current != _expected {
+        return Err("hosts изменён другой программой; повторите операцию".into());
+    }
     let result = crate::system::fs_utils::robust_write_file(path, data);
     #[cfg(windows)]
     if let Err(atomic_error) = result {

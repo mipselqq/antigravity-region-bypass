@@ -181,6 +181,20 @@ fn show_result(ok: bool) {
         print_error_details();
     }
 }
+
+fn show_network_result(setup: &crate::net::NetworkSetup) -> bool {
+    crate::net::relay::log_event(&setup.message);
+    if setup.automatic_failover {
+        println!("  \x1b[92m✓\x1b[0m DNS настроен, автоматическое переключение включено");
+    } else {
+        eprintln!(
+            "  \x1b[93m!\x1b[0m DNS настроен частично: автоматическое переключение недоступно"
+        );
+        eprintln!("  {}", setup.message);
+        print_error_details();
+    }
+    setup.automatic_failover
+}
 pub fn handle_unlock_all() -> bool {
     clear_screen();
     banner();
@@ -189,11 +203,10 @@ pub fn handle_unlock_all() -> bool {
         return false;
     }
     let outcome = continue_setup(patch_installations(), || {
-        let mut ok = true;
+        let mut ok;
         match apply_dns_rules() {
-            Ok(msg) => {
-                crate::net::relay::log_event(&msg);
-                println!("  \x1b[92m✓\x1b[0m Обход через DNS настроен");
+            Ok(setup) => {
+                ok = show_network_result(&setup);
                 for note in crate::core::endpoint::apply_all() {
                     match note {
                         Ok(msg) => crate::net::relay::log_event(&msg),
@@ -231,11 +244,7 @@ pub fn handle_dns_only() -> bool {
         return false;
     }
     let ok = match apply_dns_rules() {
-        Ok(msg) => {
-            crate::net::relay::log_event(&msg);
-            println!("  \x1b[92m✓\x1b[0m Обход через DNS настроен");
-            true
-        }
+        Ok(setup) => show_network_result(&setup),
         Err(e) => {
             operation_error("Не удалось завершить настройку", &e);
             false
@@ -387,6 +396,13 @@ pub fn handle_diagnostics() -> bool {
     banner();
     println!("  ПРОВЕРКА ПОДКЛЮЧЕНИЯ\n");
     let reports = crate::net::health::probe_all();
+    let state = crate::net::route_health::store().snapshot();
+    let now = crate::net::route_health::now_ms();
+    let mut ok = true;
+    if let Err(e) = &state {
+        operation_error("Не удалось прочитать историю ошибок подключения", e);
+        ok = false;
+    }
     for report in &reports {
         let label = match report.host.as_str() {
             "cloudcode-pa.googleapis.com" => "Основной сервер",
@@ -395,25 +411,37 @@ pub fn handle_diagnostics() -> bool {
         };
         if let Some(error) = &report.error {
             operation_error(&format!("{label}: нет подключения"), error);
+            ok = false;
+        } else if state
+            .as_ref()
+            .is_ok_and(|s| s.host_refused(&report.host, now))
+        {
+            println!(
+                "  \x1b[93m!\x1b[0m {label}: сеть доступна, недавно получен региональный отказ"
+            );
+            ok = false;
         } else {
-            println!("  \x1b[92m✓\x1b[0m {label}: доступен");
+            println!("  \x1b[92m✓\x1b[0m {label}: TLS/HTTP-соединение доступно");
         }
     }
-    println!("\n  Подключение к серверам проверено.");
-    println!("  Для проверки входа и ответов откройте Antigravity.");
+    println!("\n  Проверена сеть. Доступ к моделям и аккаунту этой проверкой не подтверждается.");
+    println!("  Откройте Antigravity и отправьте короткий запрос нужной модели.");
+    if let Ok(config) = crate::net::config::load() {
+        let count = crate::net::log_monitor::discover(&config.log_roots).len();
+        if !config.watch_region_errors {
+            println!("  Наблюдение за региональными ошибками отключено в настройках.");
+        } else if count == 0 {
+            println!("  Журналы языкового сервера не найдены: автоматическая реакция на региональный отказ пока невозможна.");
+        } else {
+            println!("  Найдено журналов языкового сервера: {count}.");
+        }
+    }
     if crate::net::socket::legacy_tcp_pending() {
         println!("\n  Сохранены старые настройки сети из предыдущей версии.");
         println!("  Они не относятся к текущему включению обхода.");
     }
-    let ok = reports.iter().all(|r| r.error.is_none());
     for report in &reports {
         crate::net::relay::log_event(&format!("Диагностика: {report:?}"));
-        if crate::net::route_health::store()
-            .snapshot()
-            .is_ok_and(|s| s.host_refused(&report.host, crate::net::route_health::now_ms()))
-        {
-            println!("  Недавно приложение сообщало о региональном ограничении.");
-        }
     }
     crate::net::relay::log_event(&format!(
         "DNS servers: {:?}; config: {:?}",

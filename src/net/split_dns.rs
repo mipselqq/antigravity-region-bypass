@@ -7,7 +7,7 @@ pub fn preflight(directory: &Path, domains: &[&str]) -> Result<(), String> {
     for domain in domains {
         let path = directory.join(domain.trim_start_matches('.'));
         match fs::metadata(&path) {
-            Ok(_) if !crate::system::journal::has_record(&path) => {
+            Ok(_) if !crate::system::journal::verify_recorded_file(&path)? => {
                 return Err(format!("Уже существует DNS-настройка {}. Файл сохранён; устраните конфликт перед включением обхода.", path.display()));
             }
             Ok(_) => {}
@@ -24,6 +24,13 @@ fn normalized_rules(rules: &[(String, String)]) -> Result<BTreeMap<String, Strin
         let domain = domain.trim_start_matches('.').to_ascii_lowercase();
         if domain.is_empty() || domain.contains(['/', '\\']) || domain == ".." {
             return Err("Некорректное имя DNS-домена".into());
+        }
+        if servers.is_empty()
+            || servers
+                .split(';')
+                .any(|s| s.parse::<std::net::IpAddr>().is_err())
+        {
+            return Err(format!("Некорректный DNS-сервер для {domain}"));
         }
         if normalized
             .insert(domain.clone(), servers.clone())
@@ -88,6 +95,27 @@ pub fn remove(directory: &Path, domains: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reconfiguration_validates_every_rule_and_preserves_user_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = vec![("a.test".into(), "127.0.0.1".into())];
+        apply(dir.path(), &initial).unwrap();
+        let before = fs::read(dir.path().join("a.test")).unwrap();
+        let invalid = vec![
+            ("a.test".into(), "192.0.2.1".into()),
+            ("z.test".into(), "bad-ip".into()),
+        ];
+        assert!(apply(dir.path(), &invalid).is_err());
+        assert_eq!(fs::read(dir.path().join("a.test")).unwrap(), before);
+        assert!(!dir.path().join("z.test").exists());
+        let custom = "nameserver 192.0.2.9\n";
+        fs::write(dir.path().join("a.test"), custom).unwrap();
+        assert!(apply(dir.path(), &initial).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.test")).unwrap(),
+            custom
+        );
+    }
     #[test]
     fn normalized_domains_roundtrip_once_and_keep_user_files() {
         let dir = tempfile::tempdir().unwrap();

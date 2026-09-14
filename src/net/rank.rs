@@ -39,7 +39,9 @@ pub fn spawn_background(manage_system: bool) {
             .checked_sub(FULL_EVERY)
             .unwrap_or_else(Instant::now);
         let mut seen_revision = 0;
+        let mut last_network = None;
         loop {
+            let changed_network = refresh_interface(&mut last_network);
             let stale = file_age().map(|a| a >= FULL_EVERY).unwrap_or(true);
             let leader_dead = any_path_dead();
             let revision = super::route_health::store()
@@ -47,9 +49,9 @@ pub fn spawn_background(manage_system: bool) {
                 .map(|s| s.revision)
                 .unwrap_or(0);
             let refused = revision != seen_revision;
-            seen_revision = revision;
             let since = last_full.elapsed();
-            let run = refused
+            let run = changed_network
+                || refused
                 || (leader_dead && since >= MIN_RESCAN_AFTER_DEAD)
                 || (stale && since >= WATCH_EVERY)
                 || (stale && !rank_path().exists());
@@ -58,9 +60,19 @@ pub fn spawn_background(manage_system: bool) {
                 let ranked = rescan(load_if_index(), manage_system);
                 match ranked {
                     Ok(r) => {
-                        relay::log_line(&format!("rank {} {}", why, format_notes(&r).join("; ")))
+                        seen_revision = revision;
+                        last_full = Instant::now();
+                        relay::log_event(&format!("rank {} {}", why, format_notes(&r).join("; ")))
                     }
-                    Err(e) => relay::log_fatal(&format!("rank: {e}")),
+                    Err(e) => {
+                        if manage_system {
+                            if let Err(e) = prune_refused_pins() {
+                                relay::log_fatal(&e);
+                            }
+                        }
+                        relay::log_fatal(&format!("rank: {e}"));
+                        relay::log_event(&format!("Повторный выбор маршрута не завершён: {e}"));
+                    }
                 }
                 if refused && manage_system {
                     #[cfg(windows)]
@@ -74,7 +86,6 @@ pub fn spawn_background(manage_system: bool) {
                         .arg("-flushcache")
                         .output();
                 }
-                last_full = Instant::now();
             } else if manage_system {
                 // VPN may have wiped /32s; cheap to re-pin current proxy IPs.
                 refresh_routes_from_disk();
@@ -88,6 +99,27 @@ pub fn spawn_background(manage_system: bool) {
             thread::sleep(WATCH_EVERY);
         }
     });
+}
+
+fn refresh_interface(last: &mut Option<(u32, Option<String>)>) -> bool {
+    let Some(egress) = super::egress::detect() else {
+        return false;
+    };
+    let current = (egress.if_index, egress.gateway);
+    if egress.if_index == 0 || last.as_ref() == Some(&current) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    if egress.vpn_active {
+        return false;
+    }
+    *last = Some(current);
+    relay::save_if_index(egress.if_index);
+    resolvers::invalidate_network_caches();
+    if let Err(e) = super::route_health::store().update(|s| s.invalidate_probes()) {
+        relay::log_fatal(&e);
+    }
+    true
 }
 
 pub fn rescan_agent(if_index: u32) -> Result<Vec<RankedHost>, String> {
@@ -333,11 +365,44 @@ fn hosts_entries(ranked: &[RankedHost]) -> Vec<(String, Ipv4Addr)> {
 
 fn apply_hosts(ranked: &[RankedHost]) -> Result<(), String> {
     let entries = hosts_entries(ranked);
+    install_pins(&entries)
+}
+
+fn install_pins(entries: &[(String, Ipv4Addr)]) -> Result<(), String> {
     if entries.is_empty() {
-        crate::net::hosts::remove_entries()
+        crate::net::hosts::remove_entries()?;
     } else {
-        write_hosts_entries(&entries)
+        write_hosts_entries(entries)?;
     }
+    let keys: Vec<_> = entries
+        .iter()
+        .map(|(host, ip)| super::route_health::Key::ip(host, (*ip, 443).into()))
+        .collect();
+    super::route_health::store().update(|s| s.set_pinned(&keys, super::route_health::now_ms()))
+}
+
+fn prune_refused_pins() -> Result<(), String> {
+    let state = super::route_health::store().snapshot()?;
+    let original = super::hosts::owned_entries()?;
+    let keep = retained_pins(&original, &state, super::route_health::now_ms());
+    if keep != original {
+        install_pins(&keep)?;
+    }
+    Ok(())
+}
+
+fn retained_pins(
+    entries: &[(String, Ipv4Addr)],
+    state: &super::route_health::State,
+    now: u64,
+) -> Vec<(String, Ipv4Addr)> {
+    entries
+        .iter()
+        .filter(|(host, ip)| {
+            !state.region_blocked(&super::route_health::Key::ip(host, (*ip, 443).into()), now)
+        })
+        .cloned()
+        .collect()
 }
 
 fn save(ranked: &[RankedHost]) -> Result<(), String> {
@@ -393,6 +458,24 @@ fn load() -> Vec<RankedHost> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_rescan_removes_region_refused_pins_but_preserves_temporarily_offline_hosts() {
+        use super::super::route_health::{Key, State};
+        let mut state = State::default();
+        let a = (
+            "cloudcode-pa.googleapis.com".to_string(),
+            "192.0.2.1".parse().unwrap(),
+        );
+        let b = (
+            "generativelanguage.googleapis.com".to_string(),
+            "192.0.2.2".parse().unwrap(),
+        );
+        let key = Key::ip(&a.0, (a.1, 443).into());
+        state.set_pinned(&[key.clone()], 1);
+        state.region_refusal("region", Some(&a.0), None, 2);
+        state.record(&Key::ip(&b.0, (b.1, 443).into()), Err(()), 2);
+        assert_eq!(retained_pins(&[a, b.clone()], &state, 3), vec![b]);
+    }
     #[test]
     fn hosts_pins_follow_verified_leaders_and_skip_unreachable_hosts() {
         let first = Ipv4Addr::new(192, 0, 2, 1);

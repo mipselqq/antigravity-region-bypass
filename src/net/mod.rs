@@ -68,7 +68,12 @@ pub fn preflight() -> Result<(), String> {
     Ok(())
 }
 
-pub fn apply_dns_rules() -> Result<String, String> {
+pub struct NetworkSetup {
+    pub message: String,
+    pub automatic_failover: bool,
+}
+
+pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
     fn step(msg: &str) {
         println!("  \x1b[90m… {}\x1b[0m", msg);
         let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -77,7 +82,8 @@ pub fn apply_dns_rules() -> Result<String, String> {
     preflight()?;
     config::prepare_service()?;
     step("Подготавливаем подключение");
-    remove_dns_configuration(false)?;
+    // Reconfigure owned rules in place. Removing the working service/hosts/DNS
+    // before discovery left users disconnected whenever all probes failed.
 
     let names = nrpt_domains();
     step("Проверяем настройки сети");
@@ -88,7 +94,6 @@ pub fn apply_dns_rules() -> Result<String, String> {
             conflicts.join(", ")
         ));
     }
-    crate::net::doh::disable_system_doh()?;
 
     step("Определяем подключение к интернету");
     let egress = crate::net::egress::detect();
@@ -159,6 +164,7 @@ pub fn apply_dns_rules() -> Result<String, String> {
     for note in crate::net::rank::format_notes(&ranked) {
         sub_notes.push(note);
     }
+    crate::net::doh::disable_system_doh()?;
 
     let mut relay_ok = false;
     let mut relay_note = String::new();
@@ -227,7 +233,10 @@ pub fn apply_dns_rules() -> Result<String, String> {
         msg.push_str(" | ");
         msg.push_str(&sub_notes.join("; "));
     }
-    Ok(msg)
+    Ok(NetworkSetup {
+        message: msg,
+        automatic_failover: relay_ok,
+    })
 }
 
 fn relay_answers() -> bool {
