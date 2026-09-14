@@ -153,7 +153,7 @@ impl Watcher {
     }
 }
 
-fn discover(roots: &[PathBuf]) -> Vec<PathBuf> {
+pub fn discover(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut pending: Vec<_> = roots.iter().cloned().map(|p| (p, 0)).collect();
     let mut found = Vec::new();
     let mut visited = 0;
@@ -209,7 +209,23 @@ pub fn spawn_background() {
                     config_error.clear();
                     if config.watch_region_errors {
                         for event in watcher.poll(&config.log_roots) {
+                            let pins = match super::hosts::owned_entries() {
+                                Ok(pins) => pins,
+                                Err(e) => {
+                                    super::relay::log_event(&e);
+                                    continue;
+                                }
+                            };
                             let outcome = super::route_health::store().update(|state| {
+                                // Read actual installed pins, including after a daemon restart.
+                                // A damaged/unreadable hosts file must not authorize a guessed ban.
+                                let keys: Vec<_> = pins
+                                    .iter()
+                                    .map(|(host, ip)| {
+                                        super::route_health::Key::ip(host, (*ip, 443).into())
+                                    })
+                                    .collect();
+                                state.set_pinned(&keys, super::route_health::now_ms());
                                 let before = state.revision;
                                 let route = state.region_refusal(
                                     &event.id,
@@ -248,6 +264,44 @@ pub fn spawn_background() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_log_refusal_switches_a_pinned_route_without_a_dns_request() {
+        use super::super::route_health::{Key, State};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("language_server.log");
+        fs::write(&path, "old log\n").unwrap();
+        let mut watcher = Watcher::default();
+        assert!(watcher.poll(&[dir.path().into()]).is_empty());
+        let a = Key::ip(
+            "cloudcode-pa.googleapis.com",
+            "192.0.2.1:443".parse().unwrap(),
+        );
+        let b = Key::ip(&a.host, "192.0.2.2:443".parse().unwrap());
+        let mut state = State::default();
+        state.set_pinned(&[a.clone()], 1);
+        use std::io::Write;
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "cloudcode-pa.googleapis.com FAILED_PRECONDITION: User location is not supported"
+        )
+        .unwrap();
+        let events = watcher.poll(&[dir.path().into()]);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            state.region_refusal(
+                &event.id,
+                event.host.as_deref(),
+                event.route.as_deref(),
+                300_000
+            ),
+            Some(a.clone())
+        );
+        state.record(&a, Ok(10), 300_001);
+        state.record(&b, Ok(90), 300_001);
+        assert_eq!(state.order(&[a, b.clone()], 300_002), vec![b]);
+        assert!(watcher.poll(&[dir.path().into()]).is_empty());
+    }
     use std::io::Write;
     #[test]
     fn tails_skip_history_handle_split_writes_and_truncation_without_copying_log_text() {

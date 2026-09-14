@@ -82,10 +82,17 @@ fn probe_with_connector(
 
 pub fn probe_ip(addr: SocketAddr, host: &str) -> Result<u128, String> {
     let start = Instant::now();
-    let stream =
-        TcpStream::connect_timeout(&addr, PROBE_BUDGET).map_err(|e| format!("TCP: {e}"))?;
-    probe_connected(stream, host, start + PROBE_BUDGET)?;
+    probe_address(addr, host, start + PROBE_BUDGET)?;
     Ok(start.elapsed().as_millis().max(1))
+}
+
+fn probe_address(addr: SocketAddr, host: &str, deadline: Instant) -> Result<u16, String> {
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or("TCP/TLS/HTTP: общий срок проверки истёк")?;
+    let stream = TcpStream::connect_timeout(&addr, left).map_err(|e| format!("TCP: {e}"))?;
+    probe_connected(stream, host, deadline)
 }
 
 pub fn check_ip(addr: SocketAddr, host: &str, refresh: bool) -> Result<u128, String> {
@@ -190,17 +197,8 @@ pub fn probe_host(host: &str) -> ConnReport {
     report.resolved = addrs.iter().map(|a| a.ip().to_string()).collect();
     let mut last_error = "DNS: нет A/AAAA".to_string();
     for addr in addrs {
-        let result = (|| {
-            let mut tls = connect_tls(addr, host, Duration::from_secs(4))?;
-            tls.get_ref()
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .map_err(|e| e.to_string())?;
-            tls.write_all(
-                format!("HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
-            )
-            .map_err(|e| format!("HTTP write: {e}"))?;
-            read_http_status(&mut tls)
-        })();
+        // Share one deadline across every address and each byte of TLS/HTTP.
+        let result = probe_address(addr, host, start + Duration::from_secs(4));
         match result {
             Ok(status) => {
                 report.http_status = Some(status);

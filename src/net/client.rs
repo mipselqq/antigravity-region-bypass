@@ -260,7 +260,19 @@ pub fn nodata_response(query: &[u8]) -> Vec<u8> {
     resp[9] = 0;
     resp[10] = 0;
     resp[11] = 0;
+    // Counts above discard OPT/other records, so discard their bytes as well.
+    if let Some(end) = skip_name_opt(query, 12).and_then(|n| n.checked_add(4)) {
+        if end <= resp.len() {
+            resp.truncate(end);
+        }
+    }
     resp
+}
+
+pub fn servfail_response(query: &[u8]) -> Vec<u8> {
+    let mut reply = nodata_response(query);
+    reply[3] |= 2;
+    reply
 }
 
 pub fn is_successful_response(buf: &[u8]) -> bool {
@@ -424,6 +436,22 @@ pub fn address_response(query: &[u8], addresses: &[Ipv4Addr]) -> Option<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn negative_responses_preserve_question_and_discard_edns_without_waiting_for_timeout() {
+        let query = build_query("cloudcode-pa.googleapis.com", 0x1234);
+        let mut edns = query.clone();
+        edns[11] = 1;
+        edns.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+        let failed = servfail_response(&edns);
+        assert!(response_matches(&query, &failed));
+        assert_eq!(failed[3] & 15, 2);
+        assert_eq!(failed.len(), query.len());
+        assert!(answer_addrs(&failed).is_empty());
+        let empty = nodata_response(&edns);
+        assert!(response_matches(&query, &empty));
+        assert!(is_successful_response(&empty));
+        assert_eq!(empty.len(), query.len());
+    }
     fn answer() -> Vec<u8> {
         let mut reply = nodata_response(&build_query("example.test", 5));
         reply[7] = 1;

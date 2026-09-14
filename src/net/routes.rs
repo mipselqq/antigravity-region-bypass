@@ -88,9 +88,23 @@ pub fn sync_physical_hosts(extra: &[Ipv4Addr]) -> Result<(), String> {
                 gateway,
                 interface,
             };
-            let script = format!("$r=@(Get-NetRoute -AddressFamily IPv4 -ErrorAction Stop | Where-Object {{ $_.DestinationPrefix -eq '{ip}/32' }}); if ($r.Count -gt 0) {{ if (@($r | Where-Object {{ $_.InterfaceIndex -eq {interface} -and $_.NextHop -eq '{gateway}' }}).Count -gt 0) {{ 'present' }} else {{ throw 'Конфликт существующего маршрута {ip}/32; он сохранён' }} }} else {{ 'missing' }}");
-            if powershell(&script)? == "present" {
-                continue;
+            match powershell(&inspect_route_script(&route, &owned))?.as_str() {
+                "present" => continue,
+                "owned-stale" => {
+                    // Move only exact recorded routes when Wi-Fi/gateway changes.
+                    let retired: Vec<_> = owned
+                        .iter()
+                        .filter(|r| r.ip == ip && *r != &route)
+                        .cloned()
+                        .collect();
+                    for old in retired {
+                        powershell(&remove_route_script(&old))?;
+                        owned.retain(|r| r != &old);
+                        save(&owned)?;
+                    }
+                }
+                "missing" => {}
+                _ => return Err("Не удалось проверить существующий маршрут".into()),
             }
             if !owned.contains(&route) {
                 owned.push(route.clone());
@@ -102,6 +116,26 @@ pub fn sync_physical_hosts(extra: &[Ipv4Addr]) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     let _ = extra;
     Ok(())
+}
+
+#[cfg(windows)]
+fn inspect_route_script(route: &OwnedRoute, owned: &[OwnedRoute]) -> String {
+    let predicates: Vec<_> = owned
+        .iter()
+        .filter(|old| old.ip == route.ip)
+        .map(|old| {
+            format!(
+                "($_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' -and $_.RouteMetric -eq 1)",
+                old.interface, old.gateway
+            )
+        })
+        .collect();
+    let tracked = if predicates.is_empty() {
+        "$false".into()
+    } else {
+        predicates.join(" -or ")
+    };
+    format!("$r=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Where-Object {{ $_.DestinationPrefix -eq '{}/32' }}); if ($r.Count -eq 0) {{ 'missing' }} elseif (@($r | Where-Object {{ $_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' }}).Count -gt 0) {{ 'present' }} elseif (@($r | Where-Object {{ -not ({tracked}) }}).Count -eq 0) {{ 'owned-stale' }} else {{ throw 'Конфликт существующего маршрута {}/32; он сохранён' }}", route.ip, route.interface, route.gateway, route.ip)
 }
 pub fn add_static_routes() -> Result<(), String> {
     sync_physical_hosts(&[])
@@ -133,6 +167,28 @@ fn remove_route_script(route: &OwnedRoute) -> String {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    #[test]
+    fn gateway_migration_accepts_only_exact_owned_routes_and_preserves_foreign_conflicts() {
+        let old = route();
+        let desired = OwnedRoute {
+            interface: 9,
+            gateway: "192.0.2.254".parse().unwrap(),
+            ..old.clone()
+        };
+        for (interface, gateway, metric, expected) in [
+            (7, "192.0.2.1", 1, Some("owned-stale")),
+            (9, "192.0.2.254", 1, Some("present")),
+            (7, "192.0.2.1", 99, None),
+            (8, "192.0.2.1", 1, None),
+        ] {
+            let script = format!("function Get-NetRoute {{ param($AddressFamily,$PolicyStore,$ErrorAction) [pscustomobject]@{{DestinationPrefix='192.0.2.25/32';InterfaceIndex={interface};NextHop='{gateway}';RouteMetric={metric}}} }}; {}", inspect_route_script(&desired, &[old.clone()]));
+            let result = powershell(&script);
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), expected),
+                None => assert!(result.is_err()),
+            }
+        }
+    }
     fn route() -> OwnedRoute {
         OwnedRoute {
             ip: "192.0.2.25".parse().unwrap(),

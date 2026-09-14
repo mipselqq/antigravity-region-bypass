@@ -1,10 +1,12 @@
 """Read-only smoke checks against the actual release binary."""
 import os
+import json
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tomllib
+import tempfile
 
 root = Path(__file__).resolve().parents[1]
 version = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
@@ -20,8 +22,8 @@ def run(*args):
 result = run("--version")
 assert result.returncode == 0 and result.stdout.strip() == f"antigravity-bypass-russia v{version}", result
 result = run("--help")
-assert result.returncode == 0 and all(word in result.stdout for word in ["unlock", "rollback", "diagnostics"]), result
-for args in [("invalid-command",), ("status", "extra")]:
+assert result.returncode == 0 and all(word in result.stdout for word in ["unlock", "rollback", "diagnostics", "report"]), result
+for args in [("invalid-command",), ("status", "extra"), ("report", ".", "extra")]:
     result = run(*args)
     assert result.returncode == 2, result
 result = run("status")
@@ -31,3 +33,21 @@ rows = [line for line in plain.splitlines() if line]
 assert len(rows) == 8 and all(len(line) == 69 for line in rows), plain
 assert all(label in plain for label in ["Обход:", "Antigravity:", "Antigravity IDE:", "Antigravity CLI:"]), plain
 print(f"PASS: release {version}, help, argument errors, status and frame alignment")
+
+# Saving evidence must work even on a runner with no installation, service or working Internet.
+# The destination is temporary; report only reads installed state and sends unauthenticated probes.
+with tempfile.TemporaryDirectory(prefix="ag diagnostics ") as temporary:
+    destination = Path(temporary)
+    result = subprocess.run([str(binary), "report", str(destination)], capture_output=True,
+                            encoding="utf-8", timeout=60)
+    assert result.returncode == 0, result
+    reports = list(destination.glob("antigravity-diagnostics-*.json"))
+    assert len(reports) == 1, reports
+    report = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert report["schema_version"] == 1 and report["bypass_version"] == version, report
+    assert report["model_access"].startswith("not_tested"), report
+    assert all(section in report["checks"] for section in ["installations", "service", "configuration", "system_network"]), report
+    assert str(destination) not in reports[0].read_text(encoding="utf-8")
+    result = run("report", str(destination / "missing"))
+    assert result.returncode == 1 and not (destination / "missing").exists(), result
+print("PASS: local diagnostic export, partial results, private destination and save failure exit code")

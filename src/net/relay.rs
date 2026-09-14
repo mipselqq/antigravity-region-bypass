@@ -45,9 +45,6 @@ pub fn local_dns_available() -> Result<bool, String> {
         Err(e) => Err(e.to_string()),
     }
 }
-#[cfg(target_os = "macos")]
-const WORKER_THREADS: usize = 1;
-#[cfg(not(target_os = "macos"))]
 const WORKER_THREADS: usize = 4;
 
 static UPSTREAM_CACHE: std::sync::RwLock<Option<Vec<Ipv4Addr>>> = std::sync::RwLock::new(None);
@@ -252,6 +249,8 @@ pub fn run() -> Result<(), String> {
                     if let Some(resp) = relay(&query) {
                         let _ = sock_c.send_to(&resp, client_addr);
                     } else {
+                        let _ =
+                            sock_c.send_to(&super::client::servfail_response(&query), client_addr);
                         let name = question_name(&query).unwrap_or_else(|| "?".into());
                         log_fatal(&format!("no answer for {} from {:?}", name, client_addr));
                     }

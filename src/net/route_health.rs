@@ -73,6 +73,8 @@ pub struct State {
     entries: BTreeMap<String, Entry>,
     leaders: BTreeMap<String, String>,
     used: Vec<Used>,
+    #[serde(default)]
+    pinned: BTreeMap<String, Key>,
     events: BTreeMap<String, u64>,
     pub revision: u64,
     pub refused_hosts: BTreeMap<String, u64>,
@@ -88,6 +90,7 @@ impl Default for State {
             entries: BTreeMap::new(),
             leaders: BTreeMap::new(),
             used: vec![],
+            pinned: BTreeMap::new(),
             events: BTreeMap::new(),
             revision: 0,
             refused_hosts: BTreeMap::new(),
@@ -97,6 +100,38 @@ impl Default for State {
     }
 }
 impl State {
+    /// Export only typed route metadata for the supported hosts, never event IDs or raw input.
+    pub fn diagnostic_snapshot(&self, now: u64) -> serde_json::Value {
+        let entries: Vec<_> = self
+            .entries
+            .values()
+            .filter_map(|e| {
+                if !super::provider::NRPT_AGENT.contains(&e.host.as_str()) {
+                    return None;
+                }
+                let address = e.route.parse::<SocketAddr>().ok()?;
+                Some(serde_json::json!({
+                    "host": e.host, "address": address, "latency_ms": e.latency_ms,
+                    "checked_ms": e.checked_ms, "transport_ok": e.ok,
+                    "failures": e.failures, "retry_ms": e.retry_ms,
+                    "region_until_ms": e.region_until_ms, "blocked_now": e.blocked(now)
+                }))
+            })
+            .collect();
+        let refused: Vec<_> = super::provider::NRPT_AGENT.iter().map(|host| {
+            serde_json::json!({"host": host, "recent_region_refusal": self.host_refused(host, now)})
+        }).collect();
+        serde_json::json!({"revision": self.revision, "entries": entries, "hosts": refused})
+    }
+
+    pub fn invalidate_probes(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.checked_ms = 0;
+            entry.ok = false;
+            entry.retry_ms = 0;
+            entry.failures = 0;
+        }
+    }
     pub fn known_addresses(&self, host: &str) -> Vec<SocketAddr> {
         self.entries
             .values()
@@ -160,14 +195,25 @@ impl State {
                     };
             }
         }
-        if self.entries.len() > MAX_ENTRIES {
+        self.trim_entries();
+    }
+    fn trim_entries(&mut self) {
+        while self.entries.len() > MAX_ENTRIES {
             let oldest = self
                 .entries
                 .iter()
+                .filter(|(_, e)| {
+                    !self
+                        .pinned
+                        .values()
+                        .any(|k| k.host == e.host && k.route == e.route)
+                })
                 .min_by_key(|(_, e)| e.checked_ms)
                 .map(|(k, _)| k.clone());
             if let Some(k) = oldest {
                 self.entries.remove(&k);
+            } else {
+                break;
             }
         }
     }
@@ -210,6 +256,29 @@ impl State {
         if self.used.len() > MAX_ENTRIES {
             self.used.remove(0);
         }
+    }
+    /// Installed hosts entries remain active without another DNS query. Keep
+    /// retired pins briefly, because a pooled connection may still use them.
+    pub fn set_pinned(&mut self, keys: &[Key], now: u64) {
+        let next: BTreeMap<_, _> = keys.iter().map(|k| (k.host.clone(), k.clone())).collect();
+        let retired: Vec<_> = self
+            .pinned
+            .values()
+            .filter(|k| next.get(&k.host) != Some(*k))
+            .cloned()
+            .collect();
+        for key in retired {
+            self.note_used(&key, now);
+        }
+        self.pinned = next;
+        for key in keys {
+            self.entries.entry(key.id()).or_insert_with(|| Entry {
+                host: key.host.clone(),
+                route: key.route.clone(),
+                ..Default::default()
+            });
+        }
+        self.trim_entries();
     }
     /// Penalise only an unambiguous, host-specific route. No global "last connection" guess.
     pub fn region_refusal(
@@ -264,7 +333,7 @@ impl State {
         {
             return None;
         }
-        let candidates: Vec<_> = self
+        let mut candidates: Vec<_> = self
             .used
             .iter()
             .filter(|u| {
@@ -272,11 +341,28 @@ impl State {
                     && now.saturating_sub(u.at) < 120_000
                     && route.is_none_or(|r| u.key.route == r)
             })
+            .map(|u| u.key.clone())
             .collect();
+        if let Some(pin) = self.pinned.get(&host) {
+            if route.is_none_or(|r| pin.route == r) && !candidates.contains(pin) {
+                candidates.push(pin.clone());
+            }
+        }
+        // An explicitly labelled remote endpoint identifies a known route even
+        // when the application used hosts or kept its connection open for hours.
+        if let Some(route) = route {
+            let explicit = Key {
+                host: host.clone(),
+                route: route.to_string(),
+            };
+            if self.entries.contains_key(&explicit.id()) {
+                candidates = vec![explicit];
+            }
+        }
         if candidates.len() != 1 {
             return None;
         }
-        let key = candidates[0].key.clone();
+        let key = candidates[0].clone();
         let e = self.entries.get_mut(&key.id())?;
         // A sequence of retries on a pooled tunnel must not continually prolong the penalty.
         if e.region_until_ms <= now {
@@ -306,7 +392,11 @@ impl Store {
             Ok(b) if b.len() <= 1024 * 1024 => {
                 let s: State =
                     serde_json::from_slice(&b).map_err(|e| format!("route-health.json: {e}"))?;
-                if s.version != 1 || s.entries.len() > MAX_ENTRIES || s.used.len() > MAX_ENTRIES {
+                if s.version != 1
+                    || s.entries.len() > MAX_ENTRIES
+                    || s.used.len() > MAX_ENTRIES
+                    || s.pinned.len() > MAX_ENTRIES
+                {
                     return Err("Некорректный формат состояния маршрутов".into());
                 }
                 Ok(s)
@@ -370,6 +460,109 @@ pub fn order(keys: &[Key]) -> Result<Vec<Key>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_state_and_full_route_table_accept_pins_without_losing_their_penalties() {
+        let mut old = serde_json::to_value(State::default()).unwrap();
+        old.as_object_mut().unwrap().remove("pinned");
+        let mut s: State = serde_json::from_value(old).unwrap();
+        for n in 0..MAX_ENTRIES {
+            s.record(
+                &Key::ip(&format!("host{n}.test"), "192.0.2.1:443".parse().unwrap()),
+                Ok(50),
+                1,
+            );
+        }
+        let pinned = key("cloudcode-pa.googleapis.com", 1);
+        s.set_pinned(&[pinned.clone()], 2);
+        assert_eq!(s.entries.len(), MAX_ENTRIES);
+        assert_eq!(
+            s.region_refusal("err", Some(&pinned.host), None, 3),
+            Some(pinned.clone())
+        );
+        s.record(&key("extra.test", 2), Ok(10), 4);
+        assert_eq!(s.entries.len(), MAX_ENTRIES);
+        assert!(s.region_blocked(&pinned, 5));
+    }
+    #[test]
+    fn persistent_hosts_pin_is_quarantined_without_dns_queries_after_restart() {
+        let mut s = State::default();
+        let a = key("cloudcode-pa.googleapis.com", 1);
+        let b = key("cloudcode-pa.googleapis.com", 2);
+        s.record(&a, Ok(20), 1);
+        s.record(&b, Ok(80), 1);
+        s.set_pinned(&[a.clone()], 2);
+        let mut restarted: State =
+            serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        assert_eq!(
+            restarted.region_refusal("err", Some(&a.host), None, 300_000),
+            Some(a.clone())
+        );
+        restarted.record(&a, Ok(10), 300_001); // Transport success must not undo a region refusal.
+        restarted.record(&b, Ok(80), 300_001);
+        assert_eq!(
+            restarted.order(&[a.clone(), b.clone()], 300_002),
+            vec![b.clone()]
+        );
+        restarted.set_pinned(&[b.clone()], 300_003);
+        assert_eq!(
+            restarted.region_refusal("pooled retry", Some(&a.host), None, 300_004),
+            None
+        );
+        assert!(!restarted.region_blocked(&b, 300_005));
+        assert!(!restarted.region_blocked(&a, 900_001));
+    }
+
+    #[test]
+    fn explicit_known_remote_does_not_require_recent_dns_but_unknown_addresses_are_ignored() {
+        let mut s = State::default();
+        let a = key("cloudcode-pa.googleapis.com", 1);
+        s.record(&a, Ok(30), 1);
+        assert_eq!(
+            s.region_refusal("explicit", Some(&a.host), Some(&a.route), 300_000),
+            Some(a.clone())
+        );
+        let unknown = key(&a.host, 2);
+        assert_eq!(
+            s.region_refusal("unknown", Some(&a.host), Some(&unknown.route), 300_001),
+            None
+        );
+        assert!(!s.region_blocked(&unknown, 300_002));
+    }
+
+    #[test]
+    fn changing_pins_does_not_blame_new_route_for_an_old_pooled_connection() {
+        let mut s = State::default();
+        let a = key("cloudcode-pa.googleapis.com", 1);
+        let b = key(&a.host, 2);
+        s.set_pinned(&[a.clone()], 1);
+        s.set_pinned(&[b.clone()], 2);
+        assert_eq!(s.region_refusal("ambiguous", Some(&a.host), None, 3), None);
+        assert_eq!(
+            s.region_refusal("current", Some(&b.host), None, 120_003),
+            Some(b.clone())
+        );
+        assert!(!s.region_blocked(&a, 120_004));
+        s.set_pinned(&[], 120_005);
+        assert_eq!(
+            s.region_refusal("removed", Some(&b.host), None, 900_000),
+            None
+        );
+    }
+
+    #[test]
+    fn network_change_rechecks_transport_without_erasing_regional_penalty() {
+        let mut s = State::default();
+        let a = key("cloudcode-pa.googleapis.com", 1);
+        let b = key(&a.host, 2);
+        s.record(&a, Ok(30), 200_000);
+        s.record(&b, Err(()), 200_000);
+        s.region_refusal("explicit", Some(&a.host), Some(&a.route), 200_001);
+        s.invalidate_probes();
+        assert!(s.region_blocked(&a, 200_002));
+        assert!(!s.blocked(&b, 200_002));
+        assert_eq!(s.cached(&b, 200_002), None);
+    }
+
     fn key(host: &str, n: u8) -> Key {
         Key::ip(host, format!("127.0.0.{n}:443").parse().unwrap())
     }

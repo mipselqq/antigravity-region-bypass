@@ -48,6 +48,24 @@ fn assemble_nameservers(via_relay: bool, substituters: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn network_writers_are_exclusive_and_unlock_without_deleting_the_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("network-update.lock");
+        let foreground = super::lock_configuration_file(&path).unwrap();
+        // A concurrent process launch on Unix may temporarily retain a duplicate
+        // descriptor until exec. Releasing the guard must not wait for that copy.
+        let inherited = foreground.0.try_clone().unwrap();
+        assert!(super::lock_configuration_file(&path).is_err());
+        drop(foreground);
+        let background = super::lock_configuration_file(&path).unwrap();
+        assert!(super::lock_configuration_file(&path).is_err());
+        drop(background);
+        drop(inherited);
+        assert!(path.exists());
+        assert!(super::lock_configuration_file(&path).is_ok());
+    }
+
+    #[test]
     fn active_relay_cannot_be_bypassed_by_external_nrpt_fallbacks() {
         assert_eq!(
             super::assemble_nameservers(true, &["1.2.3.4"]),
@@ -68,16 +86,58 @@ pub fn preflight() -> Result<(), String> {
     Ok(())
 }
 
-pub fn apply_dns_rules() -> Result<String, String> {
+pub struct NetworkSetup {
+    pub message: String,
+    pub automatic_failover: bool,
+}
+
+/// Serialize foreground setup and background OS/configuration writers. The DNS
+/// request workers deliberately do not take this lock, so existing routes work
+/// while replacement candidates are being discovered.
+pub(super) struct ConfigurationLock(std::fs::File);
+
+impl Drop for ConfigurationLock {
+    fn drop(&mut self) {
+        // Close alone can leave flock held by a descriptor inherited during fork.
+        // Only this guard owns the critical section; explicitly end it before close.
+        let _ = self.0.unlock();
+    }
+}
+
+pub(super) fn configuration_lock() -> Result<ConfigurationLock, String> {
+    let dir = relay::log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    lock_configuration_file(&dir.join("network-update.lock"))
+}
+
+fn lock_configuration_file(path: &std::path::Path) -> Result<ConfigurationLock, String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("Блокировка настройки сети: {e}"))?;
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock =>
+            "Настройки сети уже обновляются другим процессом. Повторите после завершения обновления.".to_string(),
+        other => format!("Блокировка настройки сети: {other}"),
+    })?;
+    Ok(ConfigurationLock(file))
+}
+
+pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
     fn step(msg: &str) {
         println!("  \x1b[90m… {}\x1b[0m", msg);
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
     preflight()?;
+    let _configuration = configuration_lock()?;
     config::prepare_service()?;
     step("Подготавливаем подключение");
-    remove_dns_configuration(false)?;
+    // Reconfigure owned rules in place. Removing the working service/hosts/DNS
+    // before discovery left users disconnected whenever all probes failed.
 
     let names = nrpt_domains();
     step("Проверяем настройки сети");
@@ -88,7 +148,6 @@ pub fn apply_dns_rules() -> Result<String, String> {
             conflicts.join(", ")
         ));
     }
-    crate::net::doh::disable_system_doh()?;
 
     step("Определяем подключение к интернету");
     let egress = crate::net::egress::detect();
@@ -159,6 +218,7 @@ pub fn apply_dns_rules() -> Result<String, String> {
     for note in crate::net::rank::format_notes(&ranked) {
         sub_notes.push(note);
     }
+    crate::net::doh::disable_system_doh()?;
 
     let mut relay_ok = false;
     let mut relay_note = String::new();
@@ -227,7 +287,10 @@ pub fn apply_dns_rules() -> Result<String, String> {
         msg.push_str(" | ");
         msg.push_str(&sub_notes.join("; "));
     }
-    Ok(msg)
+    Ok(NetworkSetup {
+        message: msg,
+        automatic_failover: relay_ok,
+    })
 }
 
 fn relay_answers() -> bool {
@@ -301,6 +364,7 @@ pub fn remove_dns_rules() -> Result<(), String> {
 
 fn remove_dns_configuration(restore_tcp: bool) -> Result<(), String> {
     let mut errors = Vec::new();
+    let _configuration = configuration_lock()?;
     // Stop the background writer, but retain its directory and every backup.
     crate::system::service::disable()?;
     // Remove only the obsolete marker from the experimental TUN mode.
