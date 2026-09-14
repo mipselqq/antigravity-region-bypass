@@ -159,12 +159,19 @@ pub(super) fn network(ips: &[Ipv4Addr]) -> Value {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn mac_field(line: &str) -> Option<(&str, &str)> {
+    let (name, value) = line.split_once(':')?;
+    Some((name.trim(), value.trim()))
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn mac_dns(text: &str) -> Value {
     let mut result = Vec::new();
     for block in text.split("resolver #").skip(1) {
         let domain = block
             .lines()
-            .find_map(|line| line.trim().strip_prefix("domain : "));
+            .filter_map(mac_field)
+            .find_map(|(name, value)| (name == "domain").then_some(value));
         let domain = match domain {
             Some(d) => match namespace(d.trim()) {
                 Some(d) => d,
@@ -174,13 +181,13 @@ fn mac_dns(text: &str) -> Value {
         };
         let mut servers = Vec::<IpAddr>::new();
         let mut port = None;
-        for line in block.lines().map(str::trim) {
-            if line.starts_with("nameserver[") {
-                if let Some(ip) = line.split_once(" : ").and_then(|(_, s)| s.parse().ok()) {
+        for (name, value) in block.lines().filter_map(mac_field) {
+            if name.starts_with("nameserver[") {
+                if let Ok(ip) = value.parse() {
                     servers.push(ip);
                 }
-            } else if let Some(v) = line.strip_prefix("port : ") {
-                port = v.parse::<u16>().ok();
+            } else if name == "port" {
+                port = value.parse::<u16>().ok();
             }
         }
         result.push(json!({"namespace": domain, "servers": servers, "port": port}));
@@ -192,11 +199,13 @@ fn mac_dns(text: &str) -> Value {
 fn mac_route(text: &str) -> Value {
     let gateway = text
         .lines()
-        .find_map(|s| s.trim().strip_prefix("gateway: "))
+        .filter_map(mac_field)
+        .find_map(|(name, value)| (name == "gateway").then_some(value))
         .and_then(|s| s.parse::<IpAddr>().ok());
     let interface = text
         .lines()
-        .find_map(|s| s.trim().strip_prefix("interface: "))
+        .filter_map(mac_field)
+        .find_map(|(name, value)| (name == "interface").then_some(value))
         .filter(|s| {
             regex::Regex::new(r"^(en|utun|ppp|bridge|lo)[0-9]{1,4}$")
                 .unwrap()
@@ -305,8 +314,10 @@ mod tests {
             2
         );
         assert_eq!(result["routes"].as_array().unwrap().len(), 1);
-        let mac = mac_dns("resolver #1\n domain : SECRET.corp\n nameserver[0] : 10.0.0.1\nresolver #2\n domain : cloudcode-pa.googleapis.com\n nameserver[0] : 127.0.0.1\n port : 53\n search domain[0] : SECRET.corp");
+        let mac = mac_dns("resolver #1\n domain   : SECRET.corp\n nameserver[0] : 10.0.0.1\nresolver #2\n domain   : cloudcode-pa.googleapis.com\n nameserver[0] : 127.0.0.1\n port     : 53\n search domain[0] : SECRET.corp");
         assert!(!mac.to_string().contains("SECRET"));
+        assert_eq!(mac.as_array().unwrap().len(), 1);
+        assert_eq!(mac[0]["namespace"], "cloudcode-pa.googleapis.com");
         assert_eq!(mac[0]["port"], 53);
         assert_eq!(
             mac_route(" gateway: 192.168.0.1\n interface: en0\n hostname: SECRET")["interface"],
