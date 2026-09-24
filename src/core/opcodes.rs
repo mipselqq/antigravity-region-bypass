@@ -15,9 +15,12 @@ pub const MGR_GATE_ARM64_FIX: &[u8] = b"\x23\x00\x80\x52\x03\x20\x00\x39";
 
 pub const CLI_GATE_X64_LONG_ORIG_REGEX: &str =
     r"(?s-u)\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85";
+/// Null check stays. `cmpb $0, 8(%rax)` becomes `movb $1, 8(%rax)`, so the
+/// following `jne` always leaves the ineligible path.
 pub const CLI_GATE_X64_LONG_PATCHED_REGEX: &str =
-    r"(?s-u)\x48\x85\xc0\x90\x90\x90\x90\x90\x90\x80\x78\x08\x00\x0f\x85";
-pub const CLI_GATE_X64_LONG_FIX: &[u8] = b"\x48\x85\xc0\x90\x90\x90\x90\x90\x90";
+    r"(?s-u)\x48\x85\xc0\x0f\x84....\xc6\x40\x08\x01\x0f\x85";
+pub const CLI_GATE_X64_LONG_FIX: &[u8] = b"\xc6\x40\x08\x01";
+pub const CLI_GATE_X64_LONG_FIX_AT: usize = 9;
 
 #[inline]
 pub fn regex_mgr_x64_orig() -> &'static BytesRegex {

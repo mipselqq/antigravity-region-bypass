@@ -85,14 +85,23 @@ fn apply_pattern(
     original: &regex::bytes::Regex,
     patched: &regex::bytes::Regex,
     fix: &[u8],
+    fix_at: usize,
+    multiple: bool,
 ) -> Result<(usize, usize), String> {
     let offsets: Vec<_> = original.find_iter(bytes).map(|m| m.start()).collect();
     let existing = patched.find_iter(bytes).count();
-    if offsets.len() + existing > 1 {
+    if !multiple && offsets.len() + existing > 1 {
         return Err("Неоднозначная машинная сигнатура; файл не изменён".into());
     }
     for offset in &offsets {
-        bytes[*offset..*offset + fix.len()].copy_from_slice(fix);
+        let at = offset
+            .checked_add(fix_at)
+            .ok_or("Смещение патча переполнено")?;
+        let end = at
+            .checked_add(fix.len())
+            .ok_or("Длина патча переполнена")?;
+        let slot = bytes.get_mut(at..end).ok_or("Патч выходит за пределы секции")?;
+        slot.copy_from_slice(fix);
     }
     Ok((offsets.len(), existing))
 }
@@ -100,29 +109,37 @@ fn apply_pattern(
 fn plan_binary(data: &[u8], kind: TargetKind) -> Result<Plan, String> {
     let file = object::File::parse(data)
         .map_err(|e| format!("Неподдерживаемый executable (PE/ELF/Mach-O): {e}"))?;
-    let (original, patched, fix, profile) = match (kind, file.architecture()) {
+    let (original, patched, fix, fix_at, multiple, profile) = match (kind, file.architecture()) {
         (TargetKind::LanguageServer, Architecture::X86_64) => (
             regex_mgr_x64_orig(),
             regex_mgr_x64_patched(),
             MGR_GATE_X64_FIX,
+            0,
+            false,
             "core-x64-v1",
         ),
         (TargetKind::LanguageServer, Architecture::Aarch64) => (
             regex_mgr_arm64_orig(),
             regex_mgr_arm64_patched(),
             MGR_GATE_ARM64_FIX,
+            0,
+            false,
             "core-arm64-v1",
         ),
         (TargetKind::AgyCli, Architecture::X86_64) => (
             regex_cli_x64_long_orig(),
             regex_cli_x64_long_patched(),
             CLI_GATE_X64_LONG_FIX,
-            "agy-x64-long-v1",
+            CLI_GATE_X64_LONG_FIX_AT,
+            true,
+            "agy-x64-long-v2",
         ),
         (TargetKind::AgyCli, Architecture::Aarch64) => (
             regex_mgr_arm64_orig(),
             regex_mgr_arm64_patched(),
             MGR_GATE_ARM64_FIX,
+            0,
+            false,
             "agy-arm64-v1",
         ),
         _ => return Err("Нет профиля патча для этой архитектуры/компонента".into()),
@@ -140,11 +157,12 @@ fn plan_binary(data: &[u8], kind: TargetKind) -> Result<Plan, String> {
         let section_bytes = output
             .get_mut(start..end)
             .ok_or("Секция за пределами файла")?;
-        let (c, p) = apply_pattern(section_bytes, original, patched, fix)?;
+        let (c, p) = apply_pattern(section_bytes, original, patched, fix, fix_at, multiple)?;
         changes += c;
         existing += p;
     }
-    if changes + existing != 1 {
+    let total = changes + existing;
+    if total == 0 || (!multiple && total != 1) {
         return Err(format!(
             "Версия не поддерживается профилем {profile}: совпадений {}. SHA-256 {}",
             changes + existing,
@@ -389,12 +407,27 @@ mod tests {
         }
         assert!(plan_binary(&macho_fixture(x64, 0x01000007), TargetKind::AgyCli).is_err());
         let cli = b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85";
-        assert_eq!(
-            plan_binary(&macho_fixture(cli, 0x01000007), TargetKind::AgyCli)
-                .unwrap()
-                .changes,
-            1
-        );
+        let patched = plan_binary(&macho_fixture(cli, 0x01000007), TargetKind::AgyCli).unwrap();
+        assert_eq!((patched.changes, patched.existing), (1, 0));
+        assert_eq!(&patched.data[512 + 9..512 + 13], b"\xc6\x40\x08\x01");
+        assert_eq!(&patched.data[512..512 + 9], &cli[..9]);
+        let repeated = plan_binary(&patched.data, TargetKind::AgyCli).unwrap();
+        assert_eq!((repeated.changes, repeated.existing), (0, 1));
+    }
+
+    #[test]
+    fn x64_cli_patches_every_copy_of_the_same_gate() {
+        let gate = b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85\x11\x22";
+        let other = b"\x48\x85\xc0\x0f\x84\x22\x00\x00\x00\x80\x78\x08\x00\x0f\x85\x33\x44";
+        let original = macho_fixture(&[gate.as_slice(), other.as_slice()].concat(), 0x01000007);
+        let patched = plan_binary(&original, TargetKind::AgyCli).unwrap();
+        assert_eq!(patched.profile, "agy-x64-long-v2");
+        assert_eq!((patched.changes, patched.existing), (2, 0));
+        assert_eq!(&patched.data[512 + 9..512 + 13], b"\xc6\x40\x08\x01");
+        assert_eq!(&patched.data[512 + 17 + 9..512 + 17 + 13], b"\xc6\x40\x08\x01");
+        let again = plan_binary(&patched.data, TargetKind::AgyCli).unwrap();
+        assert_eq!((again.changes, again.existing), (0, 2));
+        assert_eq!(again.data, patched.data);
     }
 
     #[test]
@@ -520,9 +553,23 @@ mod tests {
             &mut duplicate,
             regex_cli_x64_long_orig(),
             regex_cli_x64_long_patched(),
-            CLI_GATE_X64_LONG_FIX
+            CLI_GATE_X64_LONG_FIX,
+            CLI_GATE_X64_LONG_FIX_AT,
+            false
         )
         .is_err());
+        let (changes, existing) = apply_pattern(
+            &mut duplicate,
+            regex_cli_x64_long_orig(),
+            regex_cli_x64_long_patched(),
+            CLI_GATE_X64_LONG_FIX,
+            CLI_GATE_X64_LONG_FIX_AT,
+            true,
+        )
+        .unwrap();
+        assert_eq!((changes, existing), (2, 0));
+        assert_eq!(&duplicate[9..13], b"\xc6\x40\x08\x01");
+        assert_eq!(&duplicate[15 + 9..15 + 13], b"\xc6\x40\x08\x01");
     }
     #[test]
     fn partial_js_is_completed_and_unrelated_text_is_unsupported() {
